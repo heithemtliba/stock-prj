@@ -9,6 +9,7 @@ const reassort = require('./services/reassortService');
 const { buildDetailedTransferLines } = require('./services/transferPlanService');
 const config = require('./config/cegid');
 const { importerCSV } = require('./services/importCSV');
+const { createArticleSalesReader, buildWeeklySalesHistory, assertCompleteStockFetch, buildArticleStores } = require('./services/reassortDataService');
 
 const app = express();
 app.use(cors());
@@ -150,13 +151,9 @@ async function calculerReassortGlobal(opts = {}) {
 
   const resultats = { critique: [], faible: [], ok: [], total: articles.length, traites: 0, erreurs: 0, periode };
 
-  const ventesStmt = db.prepare(`
-    SELECT store_id, SUM(quantite) as total_vendu
-    FROM ventes
-    WHERE reference_article = ?
-    AND date_vente >= date('now', '-${periode.jours} days')
-    GROUP BY store_id
-  `);
+  // P0.3 : ventes et stock doivent être comparés à la même granularité.
+  // Le stock est agrégé sur tous les EAN d'un code_article ; les ventes le sont donc aussi.
+  const lireVentesParArticle = createArticleSalesReader(db, periode.jours);
 
   // Pre-calculer stock agrege par code article (evite double appel Cegid dans le loop)
   const codesUniquesArticles = [...new Set(articles.map(a => a.code_article))];
@@ -164,17 +161,16 @@ async function calculerReassortGlobal(opts = {}) {
   await asyncPool(concurrency, codesUniquesArticles, async (code) => {
     try {
       const stockList = await getStockByCodeArticle(code);
-      stockAgregeParCode[code] = {};
-      stockList.forEach(st => stockAgregeParCode[code][String(st.storeId)] = st.stock);
-    } catch(e) { stockAgregeParCode[code] = {}; }
+      stockAgregeParCode[code] = { rows: stockList, error: null };
+    } catch(e) {
+      stockAgregeParCode[code] = { rows: [], error: e };
+    }
   });
   console.log('Stock pre-calcule pour', codesUniquesArticles.length, 'articles');
   const settled = await asyncPool(concurrency, articles, async (article) => {
-    const ref = article.reference_article;
-    const stockResult = await cegid.getStockByStore(ref);
-    if (!stockResult.success) throw new Error(`Cegid stock failed for ${ref}: ${stockResult.message || 'unknown'}`);
-    const ventesDB = ventesStmt.all(ref);
-    const historiqueVentes = ventesDB.map(v => ({ storeId: v.store_id, quantite: v.total_vendu / semaines }));
+    const ref = article.reference_article; // référence représentative pour l'affichage uniquement
+    const ventesDB = lireVentesParArticle(article.code_article);
+    const historiqueVentes = buildWeeklySalesHistory(ventesDB, semaines);
       const expoRows = db.prepare(`
         SELECT v.store_id,
           CASE WHEN COUNT(d.date_envoi) > 0
@@ -186,15 +182,11 @@ async function calculerReassortGlobal(opts = {}) {
       `).all(article.code_article, article.code_article);
       const joursExposition = {};
       expoRows.forEach(r => joursExposition[r.store_id] = r.jours);
-      const storesRaw = stockResult.stores.AvailableQtyByStore || [];
-      // Utiliser stock pre-calcule (tous EAN agrege)
-      const stockAgr = stockAgregeParCode[article.code_article] || {};
-      const stores = storesRaw.map(s => ({
-        ...s,
-        AvailableQty: String(stockAgr[String(s.StoreId)] !== undefined
-          ? stockAgr[String(s.StoreId)]
-          : parseFloat(s.AvailableQty) || 0)
-      }));
+      // Stock agrégé sur tous les EAN + boutiques de vente absentes du stock => stock 0.
+      // Si une variante Cegid n'a pas pu être lue, on refuse de calculer avec un stock partiel.
+      const stockState = stockAgregeParCode[article.code_article] || { rows: [], error: null };
+      if (stockState.error) throw stockState.error;
+      const stores = buildArticleStores(stockState.rows, historiqueVentes, config.stores);
       const analyse = reassort.analyserReassort(ref, stores, historiqueVentes, article.saison, periode.soldes, joursExposition);
       const aCritique = analyse.analyse.some(s => s.statut === 'CRITIQUE');
       const aFaible   = analyse.analyse.some(s => s.statut === 'FAIBLE');
@@ -1133,17 +1125,23 @@ async function getStockByCodeArticle(codeArticle) {
     "SELECT DISTINCT reference_article FROM ventes WHERE code_article = ? AND reference_article IS NOT NULL"
   ).all(codeArticle);
   const stockTotal = {};
-    await asyncPool(5, refs, async ({ reference_article }) => {
+  let referencesLues = 0;
+  await asyncPool(5, refs, async ({ reference_article }) => {
     const result = await cegid.getStockByStore(reference_article);
-    if (!result.success || !result.stores.AvailableQtyByStore) return;
-    for (const st of result.stores.AvailableQtyByStore) {
+    const stores = result?.stores?.AvailableQtyByStore;
+    if (!result?.success || !Array.isArray(stores)) return;
+
+    referencesLues++;
+    for (const st of stores) {
       const qty = parseFloat(st.AvailableQty) || 0;
       if (!stockTotal[st.StoreId]) {
         stockTotal[st.StoreId] = { storeId: st.StoreId, description: st.StoreDescription, stock: 0 };
       }
       stockTotal[st.StoreId].stock += qty;
     }
-    });
+  });
+
+  assertCompleteStockFetch(refs.length, referencesLues, codeArticle);
   return Object.values(stockTotal);
 }
 
