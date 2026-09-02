@@ -6,6 +6,7 @@ const { execSync, execFile } = require('child_process');
 const fs = require('fs');
 const cegid = require('./services/cegidService');
 const reassort = require('./services/reassortService');
+const { buildDetailedTransferLines } = require('./services/transferPlanService');
 const config = require('./config/cegid');
 const { importerCSV } = require('./services/importCSV');
 
@@ -577,7 +578,7 @@ app.post('/rapport-hebdomadaire', async (req, res) => {
           suggestionsTraitees.add(key);
           try {
             const refs = db.prepare("SELECT DISTINCT reference_article, taille, couleur FROM ventes WHERE code_article = ? AND reference_article IS NOT NULL AND reference_article != ''").all(art.codeArticle);
-            const lignes = [];
+            const candidats = [];
             for (const r of refs) {
               const result = await cegid.getStockByStore(r.reference_article);
               if (!result.success) continue;
@@ -587,17 +588,17 @@ app.post('/rapport-hebdomadaire', async (req, res) => {
               const qD = stD ? Math.max(0, parseFloat(stD.AvailableQty) || 0) : 0;
               const qR = stR ? Math.max(0, parseFloat(stR.AvailableQty) || 0) : 0;
               if (qD >= 1) {
-                const qTransfert = Math.max(1, Math.floor(qD / 2));
-                lignes.push({
+                candidats.push({
                   ean: r.reference_article,
                   taille: r.taille || '',
                   couleur: r.couleur || '',
                   stockDonneur: qD,
-                  stockReceveur: qR,
-                  quantite: qTransfert
+                  stockReceveur: qR
                 });
               }
             }
+            const allocation = buildDetailedTransferLines(candidats, sug.quantite);
+            const lignes = allocation.lines;
               // Filtrer selon seuil transport
               const seuilBon = (['009','032'].includes(sug.deId) || ['009','032'].includes(sug.versId)) ? 8
                 : (['029'].includes(sug.deId) || ['029'].includes(sug.versId)) ? 5
@@ -614,7 +615,9 @@ app.post('/rapport-hebdomadaire', async (req, res) => {
                 receveur: sug.vers,
                 receveurId: sug.versId,
                 lignes,
-                totalUnites: lignes.reduce((s, l) => s + l.quantite, 0)
+                quantiteRecommandee: allocation.recommendedQuantity,
+                quantiteNonAllouee: allocation.unallocatedQuantity,
+                totalUnites: allocation.allocatedQuantity
               });
             }
           } catch(e) { /* skip */ }
@@ -816,7 +819,7 @@ const rapport = {
           suggestionsTraitees.add(key);
           try {
             const refs = db.prepare("SELECT DISTINCT reference_article, taille, couleur FROM ventes WHERE code_article = ? AND reference_article IS NOT NULL AND reference_article != ''").all(art.codeArticle);
-            const lignes = [];
+            const candidats = [];
             for (const r of refs) {
               const result = await cegid.getStockByStore(r.reference_article);
               if (!result.success) continue;
@@ -826,17 +829,17 @@ const rapport = {
               const qD = stD ? Math.max(0, parseFloat(stD.AvailableQty) || 0) : 0;
               const qR = stR ? Math.max(0, parseFloat(stR.AvailableQty) || 0) : 0;
               if (qD >= 1) {
-                const qTransfert = Math.max(1, Math.floor(qD / 2));
-                lignes.push({
+                candidats.push({
                   ean: r.reference_article,
                   taille: r.taille || '',
                   couleur: r.couleur || '',
                   stockDonneur: qD,
-                  stockReceveur: qR,
-                  quantite: qTransfert
+                  stockReceveur: qR
                 });
               }
             }
+            const allocation = buildDetailedTransferLines(candidats, sug.quantite);
+            const lignes = allocation.lines;
               // Filtrer selon seuil transport
               const seuilBon = (['009','032'].includes(sug.deId) || ['009','032'].includes(sug.versId)) ? 8
                 : (['029'].includes(sug.deId) || ['029'].includes(sug.versId)) ? 5
@@ -853,7 +856,9 @@ const rapport = {
                 receveur: sug.vers,
                 receveurId: sug.versId,
                 lignes,
-                totalUnites: lignes.reduce((s, l) => s + l.quantite, 0)
+                quantiteRecommandee: allocation.recommendedQuantity,
+                quantiteNonAllouee: allocation.unallocatedQuantity,
+                totalUnites: allocation.allocatedQuantity
               });
             }
           } catch(e) { /* skip */ }
