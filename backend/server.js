@@ -188,22 +188,23 @@ async function calculerReassortGlobal(opts = {}) {
       if (stockState.error) throw stockState.error;
       const stores = buildArticleStores(stockState.rows, historiqueVentes, config.stores);
       const analyse = reassort.analyserReassort(ref, stores, historiqueVentes, article.saison, periode.soldes, joursExposition);
-      const aCritique = analyse.analyse.some(s => s.statut === 'CRITIQUE');
-      const aFaible   = analyse.analyse.some(s => s.statut === 'FAIBLE');
+      const classementGlobal = reassort.classerReassortGlobal(analyse);
       const stockCentrale = stores.find(s => s.StoreId === '001');
       const qteCentrale = stockCentrale ? parseFloat(stockCentrale.AvailableQty) : 0;
       const ventesParSemaine = article.total / semaines;
       const score = calculerScore(analyse.analyse, ventesParSemaine, article.saison);
 
-    if (analyse.suggestions.length > 0) {
+    // Une alerte métier reste visible même si aucun transfert interne n'est possible.
+    // L'absence de donneur doit conduire à une décision humaine / commande, pas à un faux statut OK.
+    if (classementGlobal !== 'ok' || analyse.suggestions.length > 0) {
       const item = {
         reference: ref, codeArticle: article.code_article, saison: article.saison,
         stockCentrale: qteCentrale, score,
         ventesParSemaine: Math.round(ventesParSemaine * 100) / 100,
-        suggestions: analyse.suggestions,  // Utiliser suggestions originales
+        suggestions: analyse.suggestions,  // Peut être vide si aucune source interne n'est disponible
         analyse: analyse.analyse.filter(s => s.statut !== 'OK')
       };
-      return { type: aCritique ? 'critique' : (aFaible ? 'faible' : 'ok-item'), item, okRef: ref };
+      return { type: classementGlobal === 'ok' ? 'ok-item' : classementGlobal, item, okRef: ref };
     }
     return { type: 'ok-ref', okRef: ref };
   });

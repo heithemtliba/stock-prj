@@ -133,6 +133,21 @@ function calculerScoreStore(store, ventesParSemaine, saison) {
   return Math.round(ventesParSemaine * urgence * coeffSaison * 100) / 100;
 }
 
+function getJoursExposition(joursExposition, storeId) {
+  if (!joursExposition || typeof joursExposition !== 'object') return 999;
+  const key = String(storeId);
+  if (!Object.prototype.hasOwnProperty.call(joursExposition, key)) return 999;
+  const n = Number(joursExposition[key]);
+  return Number.isFinite(n) && n >= 0 ? n : 999;
+}
+
+function classerReassortGlobal(resultatAnalyse) {
+  const boutiques = Array.isArray(resultatAnalyse?.analyse) ? resultatAnalyse.analyse : [];
+  if (boutiques.some((store) => store?.statut === 'CRITIQUE')) return 'critique';
+  if (boutiques.some((store) => store?.statut === 'FAIBLE')) return 'faible';
+  return 'ok';
+}
+
 function analyserReassort(reference, stores, historiqueVentes, saison = null, soldes = false, joursExposition = {}) {
   const articleActuel = estSaisonActuelle(saison);
 
@@ -243,10 +258,10 @@ function analyserReassort(reference, stores, historiqueVentes, saison = null, so
 
       if (qteATransferer > 0) {
           // Regle 7 jours exposition minimum
-          const expoD = joursExposition[String(donneur.storeId)] || 0;
-          const expoR = joursExposition[String(receveur.storeId)] || 0;
-          if (expoD > 0 && expoD < 7) return;
-          if (expoR > 0 && expoR < 7) return;
+          const expoD = getJoursExposition(joursExposition, donneur.storeId);
+          const expoR = getJoursExposition(joursExposition, receveur.storeId);
+          if (expoD < 7) return;
+          if (expoR < 7) return;
         const consigne = articleActuel
           ? 'Article saison actuelle - redistribuer ET commander si insuffisant'
           : 'Article ancienne saison - redistribuer uniquement, ne pas commander';
@@ -288,4 +303,4 @@ function analyserReassort(reference, stores, historiqueVentes, saison = null, so
   };
 }
 
-module.exports = { analyserReassort, calculerScoreStore, optimiserRegroupements };
+module.exports = { analyserReassort, calculerScoreStore, optimiserRegroupements, classerReassortGlobal };
