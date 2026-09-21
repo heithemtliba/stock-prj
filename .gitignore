@@ -1,0 +1,5 @@
+*.backup
+*.before_*
+backend/diagnostic/*.xml
+data/*.db.backup
+*.log
