@@ -1,19 +1,41 @@
 /**
  * ══════════════════════════════════════════════════════════════════════════
- * CRON JOBS — Automatisation des tâches récurrentes
+ * CRON JOBS — Automatisation des tâches récurrentes (CORRIGÉ)
  * ══════════════════════════════════════════════════════════════════════════
  *
  * - 03:00  Import quotidien des ventes (SOAP ou CSV)
  * - 04:00  Normalisation des dates dans la base
  * - 06:00  Pré-calcul du cache reassort-global
- * - Toutes les 5 min : nettoyage des jobs rapport expirés
  *
- * Ajouter dans server.js :
+ * Ajouter dans server.js (avant app.listen) :
  *   require('./services/cronJobs')(cacheClear, calculerReassortGlobal, cacheSet);
  * ══════════════════════════════════════════════════════════════════════════
  */
 
 const cron = require('node-cron');
+
+// ── FONCTION LOCALE (évite le require circulaire avec server.js) ────────
+function getPeriodeAnalyse() {
+  const aujourd = new Date();
+  const periodes = [
+    {
+      debut: new Date(process.env.SOLDES_HIVER_DEBUT || '2026-01-29'),
+      fin:   new Date(process.env.SOLDES_HIVER_FIN   || '2026-03-29'),
+      label: 'Soldes Hiver'
+    },
+    {
+      debut: new Date(process.env.SOLDES_ETE_DEBUT || '2026-08-07'),
+      fin:   new Date(process.env.SOLDES_ETE_FIN   || '2026-10-09'),
+      label: 'Soldes Été'
+    }
+  ];
+  for (const p of periodes) {
+    if (aujourd >= p.debut && aujourd <= p.fin) {
+      return { jours: 28, label: p.label, soldes: true };
+    }
+  }
+  return { jours: 180, label: 'Normal', soldes: false };
+}
 
 module.exports = function initCronJobs(cacheClear, calculerReassortGlobal, cacheSet) {
   const db = require('../config/database');
@@ -51,13 +73,12 @@ module.exports = function initCronJobs(cacheClear, calculerReassortGlobal, cache
     }
   }, { timezone: 'Africa/Tunis' });
 
-  // ── 06:00 — Pré-calcul du reassort global ──────────────────────────
+  // ── 06:00 — Pré-calcul du reassort global (lundi-samedi) ───────────
   cron.schedule('0 6 * * 1-6', async () => {
     console.log('[CRON] Pré-calcul reassort-global...');
     try {
       const resultats = await calculerReassortGlobal();
-      const { getPeriodeAnalyse } = require('../server'); // ou passer en param
-      const periode = getPeriodeAnalyse ? getPeriodeAnalyse() : { label: 'Normal' };
+      const periode = getPeriodeAnalyse();
       cacheSet(`reassort-global:${periode.label}`, resultats);
       console.log(`[CRON] Reassort pré-calculé : ${resultats.critique.length} critiques, ${resultats.faible.length} faibles`);
     } catch (error) {
