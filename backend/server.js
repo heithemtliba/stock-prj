@@ -475,6 +475,43 @@ app.post('/export-excel', async (req, res) => {
   }
 });
 
+
+// ─── IMPORT AUTO (SOAP Cegid) ────────────────────────────────────────────────
+app.post('/import-auto', async (req, res) => {
+  try {
+    const db = require('./config/database');
+    const { importQuotidien } = require('./services/autoImportVentes');
+    
+    const options = {};
+    if (req.query.dateDebut) options.dateDebut = new Date(req.query.dateDebut);
+    if (req.query.dateFin) options.dateFin = new Date(req.query.dateFin);
+    
+    const result = await importQuotidien(db, options);
+    cacheClear();
+    res.json(result);
+  } catch (error) {
+    console.error('[IMPORT-AUTO] Erreur:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── HISTORIQUE DES IMPORTS ──────────────────────────────────────────────────
+app.get('/import-log', (req, res) => {
+  try {
+    const db = require('./config/database');
+    const limit = parseInt(req.query.limit) || 20;
+    const logs = db.prepare(`
+      SELECT * FROM import_log
+      ORDER BY id DESC
+      LIMIT ?
+    `).all(limit);
+    res.json({ success: true, logs });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+
 // â”€â”€ RAPPORT HEBDOMADAIRE EXCEL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // GÃ©nÃ¨re automatiquement le rapport complet de la semaine
 app.post('/rapport-hebdomadaire', async (req, res) => {
@@ -1162,7 +1199,13 @@ app.get('/stock-article/:codeArticle', async (req, res) => {
     res.status(500).json({ success: false, message: error.message });
   }
 });
-
+// ─── CRON JOBS (Import quotidien à 03:00) ────────────────────────────────────
+try {
+  require('./services/cronJobs')(cacheClear, calculerReassortGlobal, cacheSet);
+  console.log('[CRON] Jobs planifiés');
+} catch (e) {
+  console.error('[CRON] Erreur initialisation:', e.message);
+}
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   const p = getPeriodeAnalyse();
