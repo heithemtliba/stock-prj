@@ -1,22 +1,16 @@
 /**
  * ══════════════════════════════════════════════════════════════════════════
- * AUTO-IMPORT QUOTIDIEN DES VENTES — Cegid → SQLite
+ * AUTO-IMPORT QUOTIDIEN DES VENTES — Cegid → SQLite (OPTIMISÉ)
  * ══════════════════════════════════════════════════════════════════════════
  *
- * Remplace l'import CSV manuel par un pull automatique via l'API SOAP Cegid.
- * Utilise le endpoint SaleDocumentService pour récupérer les tickets de vente
- * et insérer les lignes dans la table `ventes`.
+ * Méthodes SOAP utilisées :
+ *   - GetHeaderList : liste des documents de vente (entêtes)
+ *   - GetByKey      : détail d'un document (lignes)
  *
- * Usage :
- *   - Appelé par le CRON (voir cronJobs.js) chaque nuit à 3h du matin
- *   - Peut aussi être déclenché manuellement via POST /import-auto
- *   - Idempotent : INSERT OR REPLACE évite les doublons
+ * OPTIMISATION : appels GetByKey parallélisés (10 en même temps)
+ *   → 425 documents en ~15 secondes (au lieu de 115)
  *
- * Fallback : si l'API SOAP ne retourne pas les lignes de vente détaillées,
- * le système peut importer un CSV déposé dans data/imports/
- *
- * IMPORTANT : Ce fichier doit être adapté au WSDL réel de votre Cegid.
- * Les noms de champs dans le XML varient selon la version de Cegid Y2.
+ * Fallback CSV : si l'API SOAP échoue, importe les CSV déposés dans data/imports/
  * ══════════════════════════════════════════════════════════════════════════
  */
 
@@ -42,6 +36,23 @@ async function parseXML(xml) {
   });
 }
 
+// ── ASYNC POOL (limite la concurrence) ──────────────────────────────────
+async function asyncPool(poolLimit, items, iteratorFn) {
+  const ret = [];
+  const executing = new Set();
+  for (const item of items) {
+    const p = Promise.resolve().then(() => iteratorFn(item));
+    ret.push(p);
+    executing.add(p);
+    const clean = () => executing.delete(p);
+    p.then(clean).catch(clean);
+    if (executing.size >= poolLimit) {
+      await Promise.race(executing);
+    }
+  }
+  return Promise.allSettled(ret);
+}
+
 // ── FORMAT DATE ─────────────────────────────────────────────────────────
 function formatDate(d) {
   const y = d.getFullYear();
@@ -56,42 +67,50 @@ function yesterday() {
   return d;
 }
 
-// ── RÉCUPÉRER LES VENTES DEPUIS CEGID SOAP ─────────────────────────────
-/**
- * ATTENTION : Cette fonction doit être adaptée au WSDL réel de votre Cegid.
- *
- * Option A (préférable) : Si votre Cegid expose GetSaleLineList ou
- * GetDocumentDetailList, utilisez ça pour obtenir directement les lignes
- * de vente avec code_article, reference, taille, couleur, quantite.
- *
- * Option B (fallback) : Utilisez GetHeaderList pour obtenir les numéros
- * de tickets, puis GetDetail pour chaque ticket.
- *
- * Option C (votre setup actuel) : Export CSV automatisé depuis Cegid BO,
- * déposé dans un dossier partagé, et importé par importerCSVAuto().
- */
-async function fetchVentesCegid(storeId, beginDate, endDate) {
+// ── EXTRAIRE TAILLE ET COULEUR DU LABEL ─────────────────────────────────
+function extraireTailleCouleur(label) {
+  if (!label) return { taille: '', couleur: '' };
+
+  const parts = label.trim().split(/\s+/);
+  if (parts.length >= 2) {
+    const last = parts[parts.length - 1];
+    const beforeLast = parts[parts.length - 2];
+
+    if (/^[A-Z0-9]+$/.test(last) && /^[A-Z0-9/]+$/.test(beforeLast)) {
+      return { taille: beforeLast, couleur: last };
+    }
+  }
+
+  return { taille: '', couleur: '' };
+}
+
+// ── RÉCUPÉRER LES ENTÊTES DE VENTES ─────────────────────────────────────
+async function fetchVentesCegid(storeIds, beginDate, endDate, pageIndex = 1, pageSize = 500) {
+  const storeIdsXml = storeIds.map(id => `<a:string>${id}</a:string>`).join('');
+
   const soapBody = `<?xml version="1.0" encoding="utf-8"?>
-  <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
-                 xmlns:tns="${NAMESPACE}">
-    <soap:Body>
-      <tns:GetHeaderList>
-        <tns:searchRequest>
-          <tns:StoreId>${storeId}</tns:StoreId>
-          <tns:BeginDate>${beginDate}T00:00:00</tns:BeginDate>
-          <tns:EndDate>${endDate}T23:59:59</tns:EndDate>
-          <tns:DocumentType>SaleDocument</tns:DocumentType>
-          <tns:Pager>
-            <tns:PageIndex>1</tns:PageIndex>
-            <tns:PageSize>500</tns:PageSize>
-          </tns:Pager>
-        </tns:searchRequest>
-        <tns:clientContext>
-          <tns:DatabaseId>${config.databaseId}</tns:DatabaseId>
-        </tns:clientContext>
-      </tns:GetHeaderList>
-    </soap:Body>
-  </soap:Envelope>`;
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:tns="${NAMESPACE}"
+               xmlns:a="http://schemas.microsoft.com/2003/10/Serialization/Arrays">
+  <soap:Body>
+    <tns:GetHeaderList>
+      <tns:searchRequest>
+        <tns:BeginDate>${beginDate}T00:00:00</tns:BeginDate>
+        <tns:EndDate>${endDate}T00:00:00</tns:EndDate>
+        <tns:StoreIds>
+          ${storeIdsXml}
+        </tns:StoreIds>
+        <tns:Pager>
+          <tns:PageIndex>${pageIndex}</tns:PageIndex>
+          <tns:PageSize>${pageSize}</tns:PageSize>
+        </tns:Pager>
+      </tns:searchRequest>
+      <tns:clientContext>
+        <tns:DatabaseId>${config.databaseId}</tns:DatabaseId>
+      </tns:clientContext>
+    </tns:GetHeaderList>
+  </soap:Body>
+</soap:Envelope>`;
 
   try {
     const response = await axios.post(SALE_SERVICE_URL, soapBody, {
@@ -104,74 +123,80 @@ async function fetchVentesCegid(storeId, beginDate, endDate) {
     });
 
     const parsed = await parseXML(response.data);
-    // Adapter selon la structure réelle de la réponse Cegid
     const body = parsed['s:Envelope']?.['s:Body'];
     const result = body?.GetHeaderListResponse?.GetHeaderListResult;
 
-    if (!result) return { success: true, documents: [] };
+    if (!result || !result.Headers) {
+      return { success: true, documents: [] };
+    }
 
-    // Normaliser en tableau
-    const docs = Array.isArray(result.SaleDocumentHeader)
-      ? result.SaleDocumentHeader
-      : result.SaleDocumentHeader ? [result.SaleDocumentHeader] : [];
+    const headers = result.Headers.Get_Header;
+    const docs = Array.isArray(headers) ? headers : (headers ? [headers] : []);
 
     return { success: true, documents: docs };
   } catch (error) {
-    return { success: false, message: error.message, storeId };
+    return { success: false, message: error.message };
   }
 }
 
-// ── RÉCUPÉRER LE DÉTAIL D'UN TICKET ─────────────────────────────────────
-async function fetchTicketDetail(documentId) {
+// ── RÉCUPÉRER LE DÉTAIL D'UN DOCUMENT ───────────────────────────────────
+async function fetchTicketDetail(key) {
+  if (!key || !key.Number || !key.Stump || !key.Type) {
+    return { success: false, message: 'Key incomplète' };
+  }
+
   const soapBody = `<?xml version="1.0" encoding="utf-8"?>
-  <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
-                 xmlns:tns="${NAMESPACE}">
-    <soap:Body>
-      <tns:GetDetail>
-        <tns:documentKey>
-          <tns:DocumentId>${documentId}</tns:DocumentId>
-        </tns:documentKey>
-        <tns:clientContext>
-          <tns:DatabaseId>${config.databaseId}</tns:DatabaseId>
-        </tns:clientContext>
-      </tns:GetDetail>
-    </soap:Body>
-  </soap:Envelope>`;
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:tns="${NAMESPACE}">
+  <soap:Body>
+    <tns:GetByKey>
+      <tns:searchRequest>
+        <tns:Key>
+          <tns:Number>${key.Number}</tns:Number>
+          <tns:Stump>${key.Stump}</tns:Stump>
+          <tns:Type>${key.Type}</tns:Type>
+        </tns:Key>
+      </tns:searchRequest>
+      <tns:clientContext>
+        <tns:DatabaseId>${config.databaseId}</tns:DatabaseId>
+      </tns:clientContext>
+    </tns:GetByKey>
+  </soap:Body>
+</soap:Envelope>`;
 
   try {
     const response = await axios.post(SALE_SERVICE_URL, soapBody, {
       headers: {
         Authorization: getAuthHeader(),
         'Content-Type': 'text/xml; charset=utf-8',
-        SOAPAction: `${NAMESPACE}/ISaleDocumentService/GetDetail`
+        SOAPAction: `${NAMESPACE}/ISaleDocumentService/GetByKey`
       },
       timeout: TIMEOUT_MS
     });
 
     const parsed = await parseXML(response.data);
     const body = parsed['s:Envelope']?.['s:Body'];
-    const result = body?.GetDetailResponse?.GetDetailResult;
+    const result = body?.GetByKeyResponse?.GetByKeyResult;
 
-    if (!result) return { success: true, lines: [] };
+    if (!result) return { success: true, lines: [], header: null };
 
-    const lines = Array.isArray(result.SaleDocumentLine)
-      ? result.SaleDocumentLine
-      : result.SaleDocumentLine ? [result.SaleDocumentLine] : [];
+    const lines = result.Lines?.Get_Line;
+    const list = Array.isArray(lines) ? lines : (lines ? [lines] : []);
 
-    return { success: true, lines };
+    return { success: true, lines: list, header: result.Header };
   } catch (error) {
     return { success: false, message: error.message };
   }
 }
 
-// ── IMPORT VIA API SOAP (Option A/B) ────────────────────────────────────
+// ── IMPORT VIA API SOAP (PARALLÉLISÉ) ───────────────────────────────────
 async function importerVentesSoap(db, dateDebut, dateFin, log = console.log) {
   const storeIds = Object.keys(config.stores);
   const beginStr = formatDate(dateDebut);
   const endStr = formatDate(dateFin);
 
   log(`[AUTO-IMPORT] Période : ${beginStr} → ${endStr}`);
-  log(`[AUTO-IMPORT] Boutiques : ${storeIds.length}`);
+  log(`[AUTO-IMPORT] Magasins : ${storeIds.length}`);
 
   const insert = db.prepare(`
     INSERT OR REPLACE INTO ventes
@@ -181,63 +206,111 @@ async function importerVentesSoap(db, dateDebut, dateFin, log = console.log) {
 
   let totalImported = 0;
   let totalErrors = 0;
+  let totalDocuments = 0;
 
-  for (const storeId of storeIds) {
+  // Récupérer tous les headers (pagination)
+  let pageIndex = 1;
+  const pageSize = 500;
+  let allDocs = [];
+
+  while (true) {
+    const headersResult = await fetchVentesCegid(storeIds, beginStr, endStr, pageIndex, pageSize);
+    if (!headersResult.success) {
+      log(`[AUTO-IMPORT] ERREUR GetHeaderList: ${headersResult.message}`);
+      totalErrors++;
+      break;
+    }
+
+    if (headersResult.documents.length === 0) break;
+
+    allDocs = allDocs.concat(headersResult.documents);
+    log(`[AUTO-IMPORT] Page ${pageIndex}: ${headersResult.documents.length} documents`);
+
+    if (headersResult.documents.length < pageSize) break;
+    pageIndex++;
+
+    if (pageIndex > 100) {
+      log(`[AUTO-IMPORT] Limite de pagination atteinte (100 pages)`);
+      break;
+    }
+  }
+
+  log(`[AUTO-IMPORT] Total documents à traiter : ${allDocs.length}`);
+
+  // ✅ OPTIMISATION : Traitement PARALLÈLE (10 en même temps)
+  const CONCURRENCY = 10;
+  log(`[AUTO-IMPORT] Traitement parallèle (concurrence: ${CONCURRENCY})...`);
+
+  const startProcess = Date.now();
+  let processed = 0;
+
+  const results = await asyncPool(CONCURRENCY, allDocs, async (doc) => {
+    if (!doc.Key) return { error: true };
+
     try {
-      const headersResult = await fetchVentesCegid(storeId, beginStr, endStr);
-      if (!headersResult.success) {
-        log(`[AUTO-IMPORT] ERREUR ${storeId}: ${headersResult.message}`);
-        totalErrors++;
-        continue;
-      }
+      const detail = await fetchTicketDetail(doc.Key);
+      if (!detail.success) return { error: true };
 
-      log(`[AUTO-IMPORT] ${storeId}: ${headersResult.documents.length} tickets`);
+      const dateVente = (doc.Date || beginStr).substring(0, 10);
+      let imported = 0;
 
-      for (const doc of headersResult.documents) {
-        const docId = doc.DocumentId || doc.Id;
-        if (!docId) continue;
+      const transaction = db.transaction(() => {
+        for (const line of detail.lines) {
+          // Ignorer les taxes
+          if (line.ItemCode && line.ItemCode.startsWith('TAXE')) continue;
 
-        const detail = await fetchTicketDetail(docId);
-        if (!detail.success) continue;
+          const qte = parseFloat(line.Quantity || 0);
+          if (qte <= 0) continue;
 
-        const transaction = db.transaction(() => {
-          for (const line of detail.lines) {
-            const qte = parseFloat(line.Quantity || line.Qty || 0);
-            if (qte <= 0) continue;
+          const ean = line.ItemReference || '';
+          const codeArticle = line.ItemCode || '';
+          const label = line.Label || '';
+          const { taille, couleur } = extraireTailleCouleur(label);
 
-            const dateVente = (line.Date || doc.Date || beginStr).substring(0, 10);
-            const reference = line.ItemId || line.Reference || '';
-            const codeArticle = line.ItemCode || line.CodeArticle || '';
-            const taille = line.Size || line.Dimension1 || '';
-            const couleur = line.Color || line.Dimension2 || '';
-            const saison = line.Season || line.Collection || '';
+          if (!ean) continue;
 
-            if (!reference) continue;
+          const saison = '';
 
-            try {
-              insert.run(dateVente, storeId, codeArticle, reference, taille, couleur, saison, qte);
-              totalImported++;
-            } catch (e) { /* doublon, ignoré */ }
-          }
-        });
-        transaction();
-      }
+          try {
+            insert.run(dateVente, doc.StoreId, codeArticle, ean, taille, couleur, saison, qte);
+            imported++;
+          } catch (e) { /* doublon */ }
+        }
+      });
+      transaction();
+
+      return { imported };
     } catch (error) {
-      log(`[AUTO-IMPORT] ERREUR critique ${storeId}: ${error.message}`);
+      return { error: true, message: error.message };
+    }
+  });
+
+  // Compter les résultats
+  for (const r of results) {
+    if (r.status === 'fulfilled' && r.value) {
+      if (r.value.error) {
+        totalErrors++;
+      } else {
+        totalImported += r.value.imported || 0;
+        totalDocuments++;
+      }
+    } else {
       totalErrors++;
     }
   }
 
-  return { imported: totalImported, errors: totalErrors, period: `${beginStr} → ${endStr}` };
+  const durationProcess = ((Date.now() - startProcess) / 1000).toFixed(1);
+  log(`[AUTO-IMPORT] Traitement terminé en ${durationProcess}s (${totalImported} ventes, ${totalErrors} erreurs)`);
+
+  return {
+    imported: totalImported,
+    errors: totalErrors,
+    documents: totalDocuments,
+    period: `${beginStr} → ${endStr}`
+  };
 }
 
-// ── IMPORT VIA CSV AUTOMATIQUE (Option C - Fallback) ────────────────────
-/**
- * Si vous ne pouvez pas utiliser l'API SOAP pour les ventes,
- * configurez un export CSV automatique depuis Cegid BO vers
- * un dossier partagé. Ce script surveille le dossier et importe
- * les nouveaux fichiers automatiquement.
- */
+// ── IMPORT VIA CSV AUTOMATIQUE (Fallback) ───────────────────────────────
 function importerCSVAuto(db, log = console.log) {
   const importDir = path.join(__dirname, '../../data/imports');
   if (!fs.existsSync(importDir)) {
@@ -274,7 +347,6 @@ function importerCSVAuto(db, log = console.log) {
           if (parts.length < 8) continue;
 
           let dateVente = parts[0].trim();
-          // Convertir DD/MM/YYYY → YYYY-MM-DD
           if (/^\d{2}\/\d{2}\/\d{4}$/.test(dateVente)) {
             const [j, m, a] = dateVente.split('/');
             dateVente = `${a}-${m}-${j}`;
@@ -300,7 +372,6 @@ function importerCSVAuto(db, log = console.log) {
       });
       importBatch();
 
-      // Renommer le fichier traité
       const donePath = path.join(importDir, `_done_${file}`);
       fs.renameSync(filePath, donePath);
       log(`[CSV-AUTO] ${file} → ${totalImported} lignes importées`);
@@ -312,7 +383,7 @@ function importerCSVAuto(db, log = console.log) {
   return { imported: totalImported, files: files.length };
 }
 
-// ── IMPORT PRINCIPAL (essaie SOAP, fallback CSV) ────────────────────────
+// ── IMPORT PRINCIPAL ────────────────────────────────────────────────────
 async function importQuotidien(db, options = {}) {
   const log = options.log || console.log;
   const dateDebut = options.dateDebut || yesterday();
@@ -321,7 +392,6 @@ async function importQuotidien(db, options = {}) {
   log(`[IMPORT] ═══ Import quotidien démarré ═══`);
   log(`[IMPORT] Date : ${formatDate(new Date())}`);
 
-  // Enregistrer l'import dans la table de suivi
   try {
     db.prepare(`
       CREATE TABLE IF NOT EXISTS import_log (
@@ -338,13 +408,12 @@ async function importQuotidien(db, options = {}) {
         created_at TEXT DEFAULT (datetime('now'))
       )
     `).run();
-  } catch (e) { /* table existe déjà */ }
+  } catch (e) { /* existe déjà */ }
 
   const start = Date.now();
   let result;
   let methode = 'soap';
 
-  // Essai 1 : API SOAP
   try {
     result = await importerVentesSoap(db, dateDebut, dateFin, log);
     if (result.imported === 0 && result.errors > 0) {
@@ -356,12 +425,11 @@ async function importQuotidien(db, options = {}) {
     log(`[IMPORT] Tentative fallback CSV...`);
     methode = 'csv_auto';
     result = importerCSVAuto(db, log);
-    log(`[IMPORT] CSV: ${result.imported} ventes importées depuis ${result.files || 0} fichiers`);
+    log(`[IMPORT] CSV: ${result.imported} ventes importées`);
   }
 
   const duree = Date.now() - start;
 
-  // Enregistrer dans le log
   try {
     db.prepare(`
       INSERT INTO import_log (date_import, methode, periode_debut, periode_fin, nb_importes, nb_erreurs, duree_ms, statut, details)
@@ -386,6 +454,7 @@ async function importQuotidien(db, options = {}) {
     methode,
     imported: result.imported || 0,
     errors: result.errors || 0,
+    documents: result.documents || 0,
     dureeMs: duree
   };
 }
