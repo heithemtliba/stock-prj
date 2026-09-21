@@ -86,5 +86,26 @@ module.exports = function initCronJobs(cacheClear, calculerReassortGlobal, cache
     }
   }, { timezone: 'Africa/Tunis' });
 
-  console.log('[CRON] Jobs planifiés : import 03:00, normalisation 04:00, reassort 06:00');
+    // ── 05:00 Lundi — Régénérer les prévisions ML ──────────────────────
+  cron.schedule('0 5 * * 1', async () => {
+    console.log('[CRON] Régénération des prévisions ML...');
+    try {
+      const { execSync } = require('child_process');
+      const path = require('path');
+      const dbPath = path.join(__dirname, '../../data/mabrouk_updated.db');
+      const outputPath = path.join(__dirname, '../../exports/previsions.json');
+      const scriptPath = path.join(__dirname, '../../scripts/prevision_demande.py');
+      
+      execSync(`python "${scriptPath}" --db "${dbPath}" --output "${outputPath}" --top 200`, {
+        env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
+        timeout: 30 * 60 * 1000
+      });
+      
+      console.log('[CRON] Prévisions ML régénérées');
+    } catch (error) {
+      console.error('[CRON] ERREUR prévisions ML:', error.message);
+    }
+  }, { timezone: 'Africa/Tunis' });
+
+   console.log('[CRON] Jobs planifiés : import 03:00, normalisation 04:00, prévisions 05:00 (lundi), reassort 06:00');
 };

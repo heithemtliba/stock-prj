@@ -11,6 +11,21 @@ const config = require('./config/cegid');
 const { importerCSV } = require('./services/importCSV');
 const { createArticleSalesReader, buildWeeklySalesHistory, assertCompleteStockFetch, buildArticleStores } = require('./services/reassortDataService');
 
+// ─── PRÉVISIONS ML ─────────────────────────────────────────────────────────
+let previsions = {};
+try {
+  const prevPath = path.join(__dirname, '../exports/previsions.json');
+  if (fs.existsSync(prevPath)) {
+    const data = JSON.parse(fs.readFileSync(prevPath, 'utf-8'));
+    previsions = data.previsions || {};
+    console.log(`📊 Prévisions ML chargées : ${Object.keys(previsions).length} articles`);
+  } else {
+    console.log('📊 Pas de prévisions ML disponibles');
+  }
+} catch (e) {
+  console.log('📊 Erreur chargement prévisions ML:', e.message);
+}
+
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
@@ -137,7 +152,7 @@ async function calculerReassortGlobal(opts = {}) {
   const periode = getPeriodeAnalyse();
   const semaines = periode.jours / 7;
   const limit = toSafeInt(opts.limit, 500);
-  const concurrency = toSafeInt(opts.concurrency, 15);
+  const concurrency = toSafeInt(opts.concurrency, 10);
 
   const articles = db.prepare(`
     SELECT MIN(reference_article) as reference_article, code_article, saison, SUM(quantite) as total
@@ -187,7 +202,20 @@ async function calculerReassortGlobal(opts = {}) {
       const stockState = stockAgregeParCode[article.code_article] || { rows: [], error: null };
       if (stockState.error) throw stockState.error;
       const stores = buildArticleStores(stockState.rows, historiqueVentes, config.stores);
-      const analyse = reassort.analyserReassort(ref, stores, historiqueVentes, article.saison, periode.soldes, joursExposition);
+      const prixArticle = db.prepare('SELECT prix_detail FROM articles WHERE code_article = ?').get(article.code_article);
+      const prevML = previsions[article.code_article] || {};
+      const analyse = reassort.analyserReassort(
+        ref, 
+        stores, 
+        historiqueVentes, 
+        article.saison, 
+        periode.soldes, 
+        joursExposition,
+        {
+           prixUnitaire: prixArticle?.prix_detail || 0,
+           tendance: prevML.tendance || 1.0,
+           ventesHistorique: historiqueVentes.map(h => h.quantite)
+        });
       const classementGlobal = reassort.classerReassortGlobal(analyse);
       const stockCentrale = stores.find(s => s.StoreId === '001');
       const qteCentrale = stockCentrale ? parseFloat(stockCentrale.AvailableQty) : 0;
@@ -196,6 +224,10 @@ async function calculerReassortGlobal(opts = {}) {
 
     // Une alerte métier reste visible même si aucun transfert interne n'est possible.
     // L'absence de donneur doit conduire à une décision humaine / commande, pas à un faux statut OK.
+    // Exclure les sacs (ARTICLES_EXCLUS)
+    if (ARTICLES_EXCLUS.has(String(article.code_article))) {
+       return { type: 'ok-ref', okRef: ref };
+    }
     if (classementGlobal !== 'ok' || analyse.suggestions.length > 0) {
       const item = {
         reference: ref, codeArticle: article.code_article, saison: article.saison,
@@ -235,6 +267,17 @@ app.get('/hello', async (req, res) => res.json(await cegid.helloWorld()));
 
 // PÃ‰RIODE ACTUELLE
 app.get('/periode', (req, res) => res.json(getPeriodeAnalyse()));
+
+// DATE DE RÉFÉRENCE (dernière vente en base)
+app.get('/date-reference', (req, res) => {
+  try {
+    const db = require('./config/database');
+    const r = db.prepare("SELECT MAX(date_vente) as max FROM ventes").get();
+    res.json({ derniereVente: r?.max || null });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
 
 // STATUT CACHE â€” voir ce qui est en cache
 app.get('/cache-status', (req, res) => {
@@ -1055,7 +1098,7 @@ function getNomsArticles(db, codes) {
   return noms;
 }
 
-const ARTICLES_EXCLUS = new Set(["91272", "91273", "91274"]);
+const ARTICLES_EXCLUS = new Set(["91272", "91273", "91274", "91275", "91276"]);
 
 // -- CALCUL SCORES MAGASINS -------------------------------------------------
 function calculerScoresMagasins(donnees) {
