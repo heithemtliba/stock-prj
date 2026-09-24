@@ -1,7 +1,7 @@
 const Database = require('better-sqlite3');
 const path = require('path');
 
-const db = new Database(path.join(__dirname, '../../data/mabrouk.db'));
+const db = new Database(path.join(__dirname, '../../data/mabrouk_updated.db'));
 
 // Créer les tables si elles n'existent pas
 db.exec(`

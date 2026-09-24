@@ -1,0 +1,63 @@
+# ═══════════════════════════════════════════════════════
+# MABROUK STOCK — .gitignore
+# ═══════════════════════════════════════════════════════
+
+# ─── Dépendances ───
+node_modules/
+package-lock.json.bak
+
+# ─── Fichiers de base de données (NE PAS VERSIONNER) ───
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/*.db.backup
+data/*.sqbpro
+*.sqlite
+*.sqlite3
+
+# ─── Fichiers de debug/test (XML, JSON temporaires) ───
+backend/*.xml
+backend/*_wsdl.xml
+backend/*_xsd.xml
+backend/test_*.xml
+backend/response_*.xml
+backend/wsdl*.xml
+backend/xsd*.xml
+backend/prix_*.xml
+backend/test_*.js
+backend/verif_*.js
+backend/morgan_test.json
+backend/reassort_*.json
+backend/rapport_*.xlsx
+*.backup
+*.before_*
+
+# ─── Rapports générés (Python + Excel) ───
+exports/*.xlsx
+exports/*.json
+exports/tmp_*
+exports/rapport_*
+
+# ─── Logs ───
+*.log
+logs/
+
+# ─── Environnement (secrets) ───
+.env
+.env.local
+.env.*.local
+
+# ─── OS ───
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── IDE ───
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ─── Diagnostic (fichiers temporaires) ───
+backend/diagnostic/*.xml
+backend/diagnostic/*_output.txt

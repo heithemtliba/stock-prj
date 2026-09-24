@@ -6,21 +6,74 @@ const { execSync, execFile } = require('child_process');
 const fs = require('fs');
 const cegid = require('./services/cegidService');
 const reassort = require('./services/reassortService');
+const { buildDetailedTransferLines } = require('./services/transferPlanService');
 const config = require('./config/cegid');
 const { importerCSV } = require('./services/importCSV');
+const { createArticleSalesReader, buildWeeklySalesHistory, assertCompleteStockFetch, buildArticleStores } = require('./services/reassortDataService');
+
+// ─── PRÉVISIONS ML ─────────────────────────────────────────────────────────
+let previsions = {};
+try {
+  const prevPath = path.join(__dirname, '../exports/previsions.json');
+  if (fs.existsSync(prevPath)) {
+    const data = JSON.parse(fs.readFileSync(prevPath, 'utf-8'));
+    previsions = data.previsions || {};
+    console.log(`📊 Prévisions ML chargées : ${Object.keys(previsions).length} articles`);
+  } else {
+    console.log('📊 Pas de prévisions ML disponibles');
+  }
+} catch (e) {
+  console.log('📊 Erreur chargement prévisions ML:', e.message);
+}
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
-// â”€â”€ CACHE 30 MINUTES â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// Cache en mÃ©moire : clÃ© â†’ { data, timestamp }
+// ── CACHE 30 MINUTES ────────────────────────────────────────────────────
+// Cache en mémoire : clé → { data, timestamp }
 const cache = new Map();
 const CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 // Jobs en mémoire pour génération du rapport hebdo (évite timeout HTTP)
 const rapportJobs = new Map(); // id -> { status, createdAt, updatedAt, filename, outputPath, error }
 const RAPPORT_JOB_TTL_MS = 60 * 60 * 1000; // 1h
+
+// ── TIMEOUT GLOBAL POUR TOUT APPEL CEGID / PROMESSE POTENTIELLEMENT SUSPENDUE ──
+// Sans cela, un appel Cegid qui ne répond jamais (socket ouvert sans réponse) bloque
+// indéfiniment l'`await` correspondant : aucune exception n'est levée, rien n'est loggé,
+// et un job resterait en "running" pour toujours.
+function withTimeout(promise, ms, label = 'operation') {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`Timeout ${ms}ms: ${label}`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+// ── CACHE DE RÉFÉRENCE PAR JOB ───────────────────────────────────────────
+// Un job rapport-hebdomadaire refetchait la même référence EAN jusqu'à 3 fois
+// (précalcul de calculerReassortGlobal, stockParArticle, bonsTransfert).
+// Ce cache est créé une seule fois au début du job (`new Map()`) et passé
+// partout où une référence peut être demandée : chaque référence n'est
+// interrogée sur Cegid qu'UNE seule fois par exécution du job.
+// Ce n'est PAS le cache global 30 min (qui reste inchangé) : il vit le temps
+// d'un seul job puis est jeté.
+async function getStockByStoreCached(reference, refCache) {
+  if (!refCache) {
+    // Pas de cache fourni (ex: appel isolé hors job) → comportement d'origine
+    return withTimeout(cegid.getStockByStore(reference), 10000, `stock ${reference}`);
+  }
+  if (refCache.has(reference)) return refCache.get(reference);
+  let result;
+  try {
+    result = await withTimeout(cegid.getStockByStore(reference), 10000, `stock ${reference}`);
+  } catch (e) {
+    result = { success: false, error: e.message };
+  }
+  refCache.set(reference, result);
+  return result;
+}
 
 function cacheGet(key) {
   const entry = cache.get(key);
@@ -43,7 +96,7 @@ function cacheClear(pattern = null) {
   }
 }
 
-// â”€â”€ DÃ‰TECTION AUTOMATIQUE DE LA PÃ‰RIODE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── DÉTECTION AUTOMATIQUE DE LA PÉRIODE ─────────────────────────────────
 function getPeriodeAnalyse() {
   const aujourd = new Date();
   const periodes = [
@@ -55,7 +108,7 @@ function getPeriodeAnalyse() {
     {
       debut: new Date(process.env.SOLDES_ETE_DEBUT || '2026-08-07'),
       fin:   new Date(process.env.SOLDES_ETE_FIN   || '2026-10-09'),
-      label: 'Soldes EtÃ©'
+      label: 'Soldes Été'
     }
   ];
   for (const p of periodes) {
@@ -66,7 +119,7 @@ function getPeriodeAnalyse() {
   return { jours: 180, label: 'Normal', soldes: false };
 }
 
-// â”€â”€ SCORE DE PRIORITÃ‰ â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── SCORE DE PRIORITÉ ────────────────────────────────────────────────────
 function calculerScore(analyse, ventesParSemaine, saison) {
   const SAISONS_ACT = ['25H', '25E', '26E'];
   const coeffSaison = saison && SAISONS_ACT.includes(saison.trim().toUpperCase()) ? 1.5 : 1.0;
@@ -129,13 +182,17 @@ function execFileAsync(file, args, options) {
   });
 }
 
-// â”€â”€ HELPER : calculer reassort global (rÃ©utilisÃ© par 2 routes) â”€â”€â”€
+// ── HELPER : calculer reassort global (réutilisé par 2 routes) ──────────
 async function calculerReassortGlobal(opts = {}) {
   const db = require('./config/database');
   const periode = getPeriodeAnalyse();
   const semaines = periode.jours / 7;
   const limit = toSafeInt(opts.limit, 500);
-  const concurrency = toSafeInt(opts.concurrency, 15);
+  const concurrency = toSafeInt(opts.concurrency, 5); // réduit de 15 → 5 pour limiter la pression sur Cegid
+  // refCache : Map<reference, stockResult> partagée avec l'appelant (le job rapport
+  // hebdomadaire la fournit pour réutiliser ces stocks dans stockParArticle/bonsTransfert).
+  // /reassort-global n'en fournit pas : un Map local est créé et jeté à la fin, comportement inchangé.
+  const refCache = opts.refCache || new Map();
 
   const articles = db.prepare(`
     SELECT MIN(reference_article) as reference_article, code_article, saison, SUM(quantite) as total
@@ -149,31 +206,38 @@ async function calculerReassortGlobal(opts = {}) {
 
   const resultats = { critique: [], faible: [], ok: [], total: articles.length, traites: 0, erreurs: 0, periode };
 
-  const ventesStmt = db.prepare(`
-    SELECT store_id, SUM(quantite) as total_vendu
-    FROM ventes
-    WHERE reference_article = ?
-    AND date_vente >= date('now', '-${periode.jours} days')
-    GROUP BY store_id
-  `);
+  // P0.3 : ventes et stock doivent être comparés à la même granularité.
+  // Le stock est agrégé sur tous les EAN d'un code_article ; les ventes le sont donc aussi.
+  const lireVentesParArticle = createArticleSalesReader(db, periode.jours);
 
   // Pre-calculer stock agrege par code article (evite double appel Cegid dans le loop)
   const codesUniquesArticles = [...new Set(articles.map(a => a.code_article))];
   const stockAgregeParCode = {};
+  let stockProgress = 0;
   await asyncPool(concurrency, codesUniquesArticles, async (code) => {
     try {
-      const stockList = await getStockByCodeArticle(code);
-      stockAgregeParCode[code] = {};
-      stockList.forEach(st => stockAgregeParCode[code][String(st.storeId)] = st.stock);
-    } catch(e) { stockAgregeParCode[code] = {}; }
+      const stockList = await getStockByCodeArticle(code, refCache);
+      stockAgregeParCode[code] = { rows: stockList, error: null };
+    } catch(e) {
+      stockAgregeParCode[code] = { rows: [], error: e };
+    } finally {
+      stockProgress++;
+      if (stockProgress % 50 === 0 || stockProgress === codesUniquesArticles.length) {
+        console.log(`[REASSORT] Stock pré-calculé ${stockProgress}/${codesUniquesArticles.length}`);
+      }
+    }
   });
   console.log('Stock pre-calcule pour', codesUniquesArticles.length, 'articles');
+
+  let traitesProgress = 0;
   const settled = await asyncPool(concurrency, articles, async (article) => {
-    const ref = article.reference_article;
-    const stockResult = await cegid.getStockByStore(ref);
-    if (!stockResult.success) throw new Error(`Cegid stock failed for ${ref}: ${stockResult.message || 'unknown'}`);
-    const ventesDB = ventesStmt.all(ref);
-    const historiqueVentes = ventesDB.map(v => ({ storeId: v.store_id, quantite: v.total_vendu / semaines }));
+    traitesProgress++;
+    if (traitesProgress % 50 === 0 || traitesProgress === articles.length) {
+      console.log(`[REASSORT] Articles analysés ${traitesProgress}/${articles.length}`);
+    }
+    const ref = article.reference_article; // référence représentative pour l'affichage uniquement
+    const ventesDB = lireVentesParArticle(article.code_article);
+    const historiqueVentes = buildWeeklySalesHistory(ventesDB, semaines);
       const expoRows = db.prepare(`
         SELECT v.store_id,
           CASE WHEN COUNT(d.date_envoi) > 0
@@ -185,32 +249,50 @@ async function calculerReassortGlobal(opts = {}) {
       `).all(article.code_article, article.code_article);
       const joursExposition = {};
       expoRows.forEach(r => joursExposition[r.store_id] = r.jours);
-      const storesRaw = stockResult.stores.AvailableQtyByStore || [];
-      // Utiliser stock pre-calcule (tous EAN agrege)
-      const stockAgr = stockAgregeParCode[article.code_article] || {};
-      const stores = storesRaw.map(s => ({
-        ...s,
-        AvailableQty: String(stockAgr[String(s.StoreId)] !== undefined
-          ? stockAgr[String(s.StoreId)]
-          : parseFloat(s.AvailableQty) || 0)
-      }));
-      const analyse = reassort.analyserReassort(ref, stores, historiqueVentes, article.saison, periode.soldes, joursExposition);
-      const aCritique = analyse.analyse.some(s => s.statut === 'CRITIQUE');
-      const aFaible   = analyse.analyse.some(s => s.statut === 'FAIBLE');
+      // Stock agrégé sur tous les EAN + boutiques de vente absentes du stock => stock 0.
+      // Si une variante Cegid n'a pas pu être lue, on refuse de calculer avec un stock partiel.
+      const stockState = stockAgregeParCode[article.code_article] || { rows: [], error: null };
+            if (stockState.error) {
+        console.warn(`[REASSORT] Erreur stock pour ${article.code_article}:`, stockState.error.message);
+        return { type: 'ok-ref', okRef: article.reference_article };
+      }
+      const stores = buildArticleStores(stockState.rows, historiqueVentes, config.stores);
+      const prixArticle = db.prepare('SELECT prix_detail FROM articles WHERE code_article = ?').get(article.code_article);
+      const prevML = previsions[article.code_article] || {};
+            const analyse = reassort.analyserReassort(
+        ref, 
+        stores, 
+        historiqueVentes, 
+        article.saison, 
+        periode.soldes, 
+        joursExposition,
+        {
+           codeArticle: article.code_article, // ← NOUVEAU : pour le log
+           prixUnitaire: prixArticle?.prix_detail || 0,
+           tendance: prevML.tendance || 1.0,
+           ventesHistorique: historiqueVentes.map(h => h.quantite)
+        });
+      const classementGlobal = reassort.classerReassortGlobal(analyse);
       const stockCentrale = stores.find(s => s.StoreId === '001');
       const qteCentrale = stockCentrale ? parseFloat(stockCentrale.AvailableQty) : 0;
       const ventesParSemaine = article.total / semaines;
       const score = calculerScore(analyse.analyse, ventesParSemaine, article.saison);
 
-    if (analyse.suggestions.length > 0) {
+    // Une alerte métier reste visible même si aucun transfert interne n'est possible.
+    // L'absence de donneur doit conduire à une décision humaine / commande, pas à un faux statut OK.
+    // Exclure les sacs (ARTICLES_EXCLUS)
+    if (ARTICLES_EXCLUS.has(String(article.code_article))) {
+       return { type: 'ok-ref', okRef: ref };
+    }
+    if (classementGlobal !== 'ok' || analyse.suggestions.length > 0) {
       const item = {
         reference: ref, codeArticle: article.code_article, saison: article.saison,
         stockCentrale: qteCentrale, score,
         ventesParSemaine: Math.round(ventesParSemaine * 100) / 100,
-        suggestions: analyse.suggestions,  // Utiliser suggestions originales
+        suggestions: analyse.suggestions,  // Peut être vide si aucune source interne n'est disponible
         analyse: analyse.analyse.filter(s => s.statut !== 'OK')
       };
-      return { type: aCritique ? 'critique' : (aFaible ? 'faible' : 'ok-item'), item, okRef: ref };
+      return { type: classementGlobal === 'ok' ? 'ok-item' : classementGlobal, item, okRef: ref };
     }
     return { type: 'ok-ref', okRef: ref };
   });
@@ -233,16 +315,27 @@ async function calculerReassortGlobal(opts = {}) {
   return resultats;
 }
 
-// â”€â”€ ROUTES â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── ROUTES ────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => res.json({ message: 'Mabrouk Stock API - OK' }));
 app.get('/test-cegid', async (req, res) => res.json(await cegid.testConnection()));
 app.get('/hello', async (req, res) => res.json(await cegid.helloWorld()));
 
-// PÃ‰RIODE ACTUELLE
+// PÉRIODE ACTUELLE
 app.get('/periode', (req, res) => res.json(getPeriodeAnalyse()));
 
-// STATUT CACHE â€” voir ce qui est en cache
+// DATE DE RÉFÉRENCE (dernière vente en base)
+app.get('/date-reference', (req, res) => {
+  try {
+    const db = require('./config/database');
+    const r = db.prepare("SELECT MAX(date_vente) as max FROM ventes").get();
+    res.json({ derniereVente: r?.max || null });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// STATUT CACHE — voir ce qui est en cache
 app.get('/cache-status', (req, res) => {
   const now = Date.now();
   const entrees = [];
@@ -258,12 +351,45 @@ app.get('/cache-status', (req, res) => {
 app.post('/cache-clear', (req, res) => {
   const avant = cache.size;
   cacheClear();
-  res.json({ success: true, message: `Cache vidÃ© : ${avant} entrees supprimÃ©es` });
+  res.json({ success: true, message: `Cache vidé : ${avant} entrees supprimées` });
 });
 
 // STOCK
 app.get('/stock', async (req, res) => res.json(await cegid.getStockAllStores()));
-app.get('/stock/:reference', async (req, res) => res.json(await cegid.getStockByStore(req.params.reference)));
+// ─── DÉTECTION EAN vs CODE_ARTICLE ───
+const { estCodeArticle: _estCodeArticle } = require('./services/refDetection');
+const estCodeArticle = (ref) => _estCodeArticle(ref, require('./config/database'));
+
+// ─── STOCK AGRÉGÉ D'UN CODE_ARTICLE (avec cache partagé) ───
+async function getStockCodeArticleAvecCache(code) {
+  const cacheKey = `stock_${code}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return cached;
+  const stockParBoutique = await getStockByCodeArticle(code);
+  const result = { success: true, codeArticle: code, stockParBoutique };
+  cacheSet(cacheKey, result);
+  return result;
+}
+
+// STOCK — accepte EAN ou code_article
+app.get('/stock/:reference', async (req, res) => {
+  try {
+    const ref = String(req.params.reference).trim();
+
+    if (estCodeArticle(ref)) {
+      if (ARTICLES_EXCLUS.has(ref)) {
+        return res.json({ success: true, codeArticle: ref, stockParBoutique: [], type: 'code_article' });
+      }
+      const result = await getStockCodeArticleAvecCache(ref);
+      return res.json({ ...result, type: 'code_article' });
+    }
+
+    // EAN : comportement d'origine
+    return res.json(await cegid.getStockByStore(ref));
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
 
 // VENTES
 app.get('/ventes-stats', (req, res) => {
@@ -303,7 +429,7 @@ app.get('/reset-db', (req, res) => {
   } catch (error) { res.status(500).json({ success: false, message: error.message }); }
 });
 
-// IMPORT CSV â€” vide le cache aprÃ¨s import
+// IMPORT CSV — vide le cache après import
 app.post('/import-csv/:mois', (req, res) => {
   try {
     const moisNoms = { 'septembre': 'septembre_2025', 'octobre': 'octobre_2025', 'novembre': 'novembre_2025', 'decembre': 'decembre_2025', 'janvier': 'janvier_2026', 'fevrier': 'fevrier_2026', 'mars': 'mars_2026' };
@@ -312,12 +438,181 @@ app.post('/import-csv/:mois', (req, res) => {
     if (!nomFichier) return res.status(400).json({ success: false, message: 'Mois invalide' });
     const filePath = path.join(__dirname, `../data/${nomFichier}.csv`);
     const result = importerCSV(filePath, dates[req.params.mois]);
-    cacheClear(); // Nouvelles donnÃ©es = cache invalide
+    cacheClear(); // Nouvelles données = cache invalide
     res.json({ fichier: nomFichier, ...result });
   } catch (error) { res.status(500).json({ success: false, message: error.message }); }
 });
 
-// REASSORT PAR CODE-BARRES (dÃ©tail) â€” avec cache
+// ─── IMPORT ARTICLES (catalogue) ─────────────────────────────────────────────
+app.post('/import-articles', (req, res) => {
+  try {
+    const fs = require('fs');
+    const db = require('./config/database');
+    const csvPath = path.join(__dirname, '../data/articles_mabrouk.csv');
+
+    if (!fs.existsSync(csvPath)) {
+      return res.status(404).json({ success: false, message: 'CSV introuvable : ' + csvPath });
+    }
+
+    const content = fs.readFileSync(csvPath, 'utf-8');
+    const lines = content.replace(/\r\n/g, '\n').split('\n').slice(1).filter(l => l.trim());
+
+    // La table articles a une colonne "collection" (pas "saison")
+    const insert = db.prepare(`
+      INSERT OR REPLACE INTO articles
+      (code_article, libelle, famille, fournisseur, collection, prix_revient, prix_detail)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    let imported = 0;
+    let skipped = 0;
+
+    const importAll = db.transaction(() => {
+      for (const line of lines) {
+        const p = line.split(';');
+        const code = (p[2] || '').trim();
+        if (!code) { skipped++; continue; }
+
+        const libelle     = (p[3] || '').trim();
+        const famille     = (p[4] || '').trim();
+        const fournisseur = (p[5] || '').trim();
+        const collection  = (p[6] || '').trim();
+        const prixRevient = parseFloat(String(p[7] || '0').replace(',', '.')) || 0;
+        const prixDetail  = parseFloat(String(p[8] || '0').replace(',', '.')) || 0;
+
+        try {
+          insert.run(code, libelle, famille, fournisseur, collection, prixRevient, prixDetail);
+          imported++;
+        } catch (e) {
+          skipped++;
+        }
+      }
+    });
+
+    importAll();
+
+    // Invalider le cache pour que les nouvelles données soient prises en compte
+    cacheClear();
+
+    console.log(`[IMPORT-ARTICLES] ${imported} importés, ${skipped} skippés`);
+    res.json({
+      success: true,
+      imported,
+      skipped,
+      total: lines.length,
+      message: `${imported} articles importés (${skipped} ignorés)`
+    });
+  } catch (error) {
+    console.error('[IMPORT-ARTICLES] Erreur:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// IMPORT CATALOGUE ARTICLES — relit le CSV et met à jour la table articles
+app.post('/import-articles', (req, res) => {
+  try {
+    const db = require('./config/database');
+    const csvPath = path.join(__dirname, '../data/articles_mabrouk.csv');
+
+    if (!fs.existsSync(csvPath)) {
+      return res.status(404).json({ success: false, message: `Fichier introuvable : ${csvPath}` });
+    }
+
+    const content = fs.readFileSync(csvPath, 'utf-8');
+    const lines = content.split(/\r?\n/).slice(1).filter(l => l.trim());
+
+    const insert = db.prepare(`
+      INSERT OR REPLACE INTO articles
+      (code_article, libelle, famille, fournisseur, collection, prix_revient, prix_detail)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    let count = 0;
+    let ignores = 0;
+
+    const importTx = db.transaction((rows) => {
+      for (const line of rows) {
+        const p = line.split(';');
+        const code = (p[2] || '').trim();
+        if (!code) { ignores++; continue; }
+        insert.run(
+          code,
+          (p[3] || '').trim(),   // Libellé
+          (p[4] || '').trim(),   // Famille
+          (p[5] || '').trim(),   // Fournisseur principal
+          (p[6] || '').trim(),   // Collection
+          parseFloat(p[7]) || 0, // Prix de revient HT
+          parseFloat(p[8]) || 0  // Prix Détail (TTC)
+        );
+        count++;
+      }
+    });
+    importTx(lines);
+
+    cacheClear();
+
+    res.json({ success: true, imported: count, ignores, totalLignes: lines.length });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── IMPORT ARTICLES PRIX (mise à jour des prix uniquement depuis CSV) ───
+app.post('/import-articles-prix', (req, res) => {
+  try {
+    const fs = require('fs');
+    const db = require('./config/database');
+    const csvPath = path.join(__dirname, '../data/articles_mabrouk.csv');
+
+    if (!fs.existsSync(csvPath)) {
+      return res.status(404).json({ success: false, message: 'CSV introuvable : ' + csvPath });
+    }
+
+    const content = fs.readFileSync(csvPath, 'utf-8');
+    const lines = content.replace(/\r\n/g, '\n').split('\n').slice(1).filter(l => l.trim());
+
+    const update = db.prepare(`
+      UPDATE articles 
+      SET prix_revient = ?, prix_detail = ?
+      WHERE code_article = ?
+    `);
+
+    let updated = 0;
+    let skipped = 0;
+
+    const run = db.transaction(() => {
+      for (const line of lines) {
+        const p = line.split(';');
+        const code = (p[2] || '').trim();
+        if (!code) { skipped++; continue; }
+
+        const prixRevient = parseFloat(String(p[7] || '0').replace(',', '.')) || 0;
+        const prixDetail  = parseFloat(String(p[8] || '0').replace(',', '.')) || 0;
+
+        const result = update.run(prixRevient, prixDetail, code);
+        if (result.changes > 0) updated++;
+        else skipped++;
+      }
+    });
+
+    run();
+    cacheClear();
+
+    console.log(`[IMPORT-PRIX] ${updated} prix mis à jour, ${skipped} non trouvés`);
+    res.json({
+      success: true,
+      updated,
+      skipped,
+      total: lines.length,
+      message: `${updated} prix mis à jour (${skipped} articles non trouvés)`
+    });
+  } catch (error) {
+    console.error('[IMPORT-PRIX] Erreur:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// REASSORT PAR CODE-BARRES (détail) — avec cache
 app.get('/reassort/:reference', async (req, res) => {
   try {
     const db = require('./config/database');
@@ -351,7 +646,7 @@ app.get('/reassort/:reference', async (req, res) => {
   } catch (error) { res.status(500).json({ success: false, message: error.message }); }
 });
 
-// REASSORT GLOBAL â€” avec cache
+// REASSORT GLOBAL — avec cache
 app.get('/reassort-global', async (req, res) => {
   try {
     const periode = getPeriodeAnalyse();
@@ -366,7 +661,7 @@ app.get('/reassort-global', async (req, res) => {
   } catch (error) { res.status(500).json({ success: false, message: error.message }); }
 });
 
-// VUE PAR CODE ARTICLE â€” avec cache
+// VUE PAR CODE ARTICLE — avec cache
 app.get('/articles', async (req, res) => {
   try {
     const db = require('./config/database');
@@ -459,7 +754,7 @@ app.get('/articles', async (req, res) => {
   } catch (error) { res.status(500).json({ success: false, message: error.message }); }
 });
 
-// EXPORT EXCEL (transferts â€” existant)
+// EXPORT EXCEL (transferts — existant)
 app.post('/export-excel', async (req, res) => {
   try {
     const data = req.body;
@@ -481,8 +776,45 @@ app.post('/export-excel', async (req, res) => {
   }
 });
 
-// â”€â”€ RAPPORT HEBDOMADAIRE EXCEL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// GÃ©nÃ¨re automatiquement le rapport complet de la semaine
+
+// ─── IMPORT AUTO (SOAP Cegid) ────────────────────────────────────────────────
+app.post('/import-auto', async (req, res) => {
+  try {
+    const db = require('./config/database');
+    const { importQuotidien } = require('./services/autoImportVentes');
+    
+    const options = {};
+    if (req.query.dateDebut) options.dateDebut = new Date(req.query.dateDebut);
+    if (req.query.dateFin) options.dateFin = new Date(req.query.dateFin);
+    
+    const result = await importQuotidien(db, options);
+    cacheClear();
+    res.json(result);
+  } catch (error) {
+    console.error('[IMPORT-AUTO] Erreur:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── HISTORIQUE DES IMPORTS ──────────────────────────────────────────────────
+app.get('/import-log', (req, res) => {
+  try {
+    const db = require('./config/database');
+    const limit = parseInt(req.query.limit) || 20;
+    const logs = db.prepare(`
+      SELECT * FROM import_log
+      ORDER BY id DESC
+      LIMIT ?
+    `).all(limit);
+    res.json({ success: true, logs });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+
+// ── RAPPORT HEBDOMADAIRE EXCEL ──────────────────────────────────────────
+// Génère automatiquement le rapport complet de la semaine
 app.post('/rapport-hebdomadaire', async (req, res) => {
   try {
     // Mode "download direct" (historique) : peut dépasser 120s selon Cegid/volume.
@@ -491,15 +823,29 @@ app.post('/rapport-hebdomadaire', async (req, res) => {
     const db = require('./config/database');
     const periode = getPeriodeAnalyse();
 
-    // RÃ©utiliser le cache reassort-global si disponible
+    // Cache de références partagé pour toute la durée du job : une même référence
+    // EAN interrogée dans le précalcul, dans stockParArticle ou dans bonsTransfert
+    // n'est fetchée qu'UNE fois sur Cegid. Gain majeur car ces 3 étapes portent
+    // largement sur les mêmes articles (critique/faible).
+    const refCache = new Map();
+
+    // Réutiliser le cache reassort-global si disponible
     const cacheKey = `reassort-global:${periode.label}`;
-    let donnees = cacheGet(cacheKey);
+        let donnees = cacheGet(cacheKey);
     if (!donnees) {
       const limit = toSafeInt(req.query?.limit || process.env.RAPPORT_HEBDO_LIMIT, 500);
-      const concurrency = toSafeInt(req.query?.concurrency || process.env.RAPPORT_HEBDO_CONCURRENCY, 15);
-      donnees = await calculerReassortGlobal({ limit, concurrency });
-      cacheSet(cacheKey, donnees);
+      const concurrency = toSafeInt(req.query?.concurrency || process.env.RAPPORT_HEBDO_CONCURRENCY, 5);
+      try {
+        donnees = await calculerReassortGlobal({ limit, concurrency, refCache });
+        cacheSet(cacheKey, donnees);
+      } catch (err) {
+        console.error('[RAPPORT] Erreur calculReassortGlobal:', err.message);
+        return res.status(500).json({ success: false, message: `calculReassortGlobal: ${err.message}` });
+      }
     }
+    // Note : si `donnees` vient du cache 30 min (pas de calcul frais), refCache reste
+    // vide ici — il se remplira quand même au fil de stockParArticle/bonsTransfert
+    // ci-dessous, qui elles-mêmes se dédoublonnent mutuellement.
 
     // Stats ventes 7 derniers jours par boutique
     const ventesParBoutique7j = db.prepare(`
@@ -510,7 +856,7 @@ app.post('/rapport-hebdomadaire', async (req, res) => {
       ORDER BY total_ventes DESC
     `).all();
 
-    // Total ventes semaine courante vs semaine prÃ©cÃ©dente
+    // Total ventes semaine courante vs semaine précédente
     const ventesCetteSemaine = db.prepare(`SELECT COALESCE(SUM(quantite),0) as total FROM ventes WHERE date_vente >= date('now', '-7 days')`).get();
     const ventesSemainePrec  = db.prepare(`SELECT COALESCE(SUM(quantite),0) as total FROM ventes WHERE date_vente >= date('now', '-14 days') AND date_vente < date('now', '-7 days')`).get();
 
@@ -525,7 +871,7 @@ app.post('/rapport-hebdomadaire', async (req, res) => {
       LIMIT 10
     `).all();
 
-    // Articles sans mouvement cette semaine (potentielles dÃ©marques)
+    // Articles sans mouvement cette semaine (potentielles démarques)
     const articlesInactifs = db.prepare(`
       SELECT code_article, saison, SUM(quantite) as total_periode,
                       ROUND(SUM(quantite) * 7.0 / 28, 2) as ventes_semaine,
@@ -558,9 +904,14 @@ app.post('/rapport-hebdomadaire', async (req, res) => {
         if (a) prixArticles[code] = a.prix_detail;
       }
       const stockParArticle = {};
+      let stockArticleProgress = 0;
       for (const code of codesRapport) {
+        stockArticleProgress++;
+        if (stockArticleProgress % 50 === 0 || stockArticleProgress === codesRapport.length) {
+          console.log(`[RAPPORT] stockParArticle ${stockArticleProgress}/${codesRapport.length}`);
+        }
         try {
-          const stockList = await getStockByCodeArticle(code);
+          const stockList = await getStockByCodeArticle(code, refCache); // réutilise le cache du job
           stockParArticle[code] = {};
           for (const st of stockList) stockParArticle[code][String(st.storeId)] = st.stock;
         } catch(e) { stockParArticle[code] = {}; }
@@ -569,6 +920,9 @@ app.post('/rapport-hebdomadaire', async (req, res) => {
       // Bons de transfert detailles par variante (taille/couleur)
       const bonsTransfert = [];
       const suggestionsTraitees = new Set();
+      // Registre du stock donneur restant (clé = `${donneurId}|${ean}`)
+      // Évite le sur-transfert entre les bons d'un même job.
+      const donorLedger = new Map();
       for (const art of donnees.critique) {
         if (ARTICLES_EXCLUS.has(String(art.codeArticle))) continue;
         for (const sug of (art.suggestions || [])) {
@@ -577,34 +931,61 @@ app.post('/rapport-hebdomadaire', async (req, res) => {
           suggestionsTraitees.add(key);
           try {
             const refs = db.prepare("SELECT DISTINCT reference_article, taille, couleur FROM ventes WHERE code_article = ? AND reference_article IS NOT NULL AND reference_article != ''").all(art.codeArticle);
-            const lignes = [];
+            const candidats = [];
             for (const r of refs) {
-              const result = await cegid.getStockByStore(r.reference_article);
+              // Timeout obligatoire : un appel Cegid qui ne répond jamais bloquerait
+              // sinon cet `await` indéfiniment (c'est le point de blocage identifié).
+              let result;
+              try {
+                result = await getStockByStoreCached(r.reference_article, refCache); // réutilise le cache du job au lieu de refetcher
+              } catch (e) {
+                console.warn(`[BONS-TRANSFERT] Timeout/erreur ${r.reference_article}: ${e.message}`);
+                continue;
+              }
               if (!result.success) continue;
               const stores = result.stores.AvailableQtyByStore || [];
               const stD = stores.find(s => s.StoreId === sug.deId);
               const stR = stores.find(s => s.StoreId === sug.versId);
               const qD = stD ? Math.max(0, parseFloat(stD.AvailableQty) || 0) : 0;
               const qR = stR ? Math.max(0, parseFloat(stR.AvailableQty) || 0) : 0;
-              if (qD >= 1) {
-                const qTransfert = Math.max(1, Math.floor(qD / 2));
-                lignes.push({
+                            if (qD >= 1) {
+                // Lire le stock restant depuis le ledger (décrémenté par les bons précédents)
+                const ledgerKey = `${sug.deId}|${r.reference_article}`;
+                if (!donorLedger.has(ledgerKey)) donorLedger.set(ledgerKey, qD);
+                const restant = donorLedger.get(ledgerKey);
+
+                // Skip si le stock a été épuisé par des bons précédents
+                if (restant < 1) continue;
+
+                candidats.push({
                   ean: r.reference_article,
                   taille: r.taille || '',
                   couleur: r.couleur || '',
                   stockDonneur: qD,
-                  stockReceveur: qR,
-                  quantite: qTransfert
+                  remainingDonneur: restant,
+                  stockReceveur: qR
                 });
               }
             }
+            const allocation = buildDetailedTransferLines(candidats, sug.quantite);
+            const lignes = allocation.lines;
               // Filtrer selon seuil transport
               const seuilBon = (['009','032'].includes(sug.deId) || ['009','032'].includes(sug.versId)) ? 8
                 : (['029'].includes(sug.deId) || ['029'].includes(sug.versId)) ? 5
                 : (['011'].includes(sug.deId) || ['011'].includes(sug.versId)) ? 5 : 1;
               const totalBon = lignes.reduce((s,l) => s + l.quantite, 0);
               if (totalBon < seuilBon) { /* skip - sous seuil */ } else
-            if (lignes.length > 0) {
+                        if (lignes.length > 0) {
+              // Décrémenter le ledger : ce stock est maintenant "réservé"
+              // pour ne pas être proposé à un autre receveur dans le même job.
+              for (const ligne of lignes) {
+                const ledgerKey = `${sug.deId}|${ligne.ean}`;
+                donorLedger.set(
+                  ledgerKey,
+                  Math.max(0, (donorLedger.get(ledgerKey) ?? 0) - ligne.quantite)
+                );
+              }
+
               bonsTransfert.push({
                 codeArticle: art.codeArticle,
                 nomArticle: getNomsArticles(db, [String(art.codeArticle)])[String(art.codeArticle)] || '',
@@ -614,7 +995,9 @@ app.post('/rapport-hebdomadaire', async (req, res) => {
                 receveur: sug.vers,
                 receveurId: sug.versId,
                 lignes,
-                totalUnites: lignes.reduce((s, l) => s + l.quantite, 0)
+                quantiteRecommande: allocation.recommendedQuantity,
+                quantiteNonAllouee: allocation.unallocatedQuantity,
+                totalUnites: allocation.allocatedQuantity
               });
             }
           } catch(e) { /* skip */ }
@@ -694,14 +1077,14 @@ const rapport = {
       rupturesNouvelleCollection: calculerRupturesNouvelleCollection(donnees, db, periode)
     };
 
-    // GÃ©nÃ©rer le fichier Excel via le script Python
+    // Générer le fichier Excel via le script Python
     const scriptPath = path.join(__dirname, '../scripts/exportRapportHebdo.py');
     const exportsDir = path.join(__dirname, '../exports');
     if (!fs.existsSync(exportsDir)) fs.mkdirSync(exportsDir);
 
     const now = new Date();
     const dateStr = now.toISOString().slice(0,10).replace(/-/g,'');
-    // NumÃ©ro de semaine ISO
+    // Numéro de semaine ISO
     const startOfYear = new Date(now.getFullYear(), 0, 1);
     const weekNum = Math.ceil(((now - startOfYear) / 86400000 + startOfYear.getDay() + 1) / 7);
     const filename = `rapport_hebdo_S${weekNum}_${dateStr}.xlsx`;
@@ -730,18 +1113,32 @@ const rapport = {
         rapportJobs.set(jobId, { ...current, ...patch, updatedAt: Date.now() });
       };
 
+      // Filet de sécurité global : même si un cas non prévu échappe aux timeouts
+      // ponctuels ci-dessous, le job ne restera JAMAIS en "running" indéfiniment.
       try {
+        await withTimeout((async () => {
         setJob({ status: 'running' });
         const db = require('./config/database');
         const periode = getPeriodeAnalyse();
 
+        // Cache de références partagé pour toute la durée du job (voir mode download) :
+        // une référence EAN n'est interrogée sur Cegid qu'UNE fois, réutilisée par
+        // le précalcul, stockParArticle et bonsTransfert.
+        const refCache = new Map();
+
         const cacheKey = `reassort-global:${periode.label}`;
-        let donnees = cacheGet(cacheKey);
+                let donnees = cacheGet(cacheKey);
         if (!donnees) {
           const limit = toSafeInt(req.query?.limit || process.env.RAPPORT_HEBDO_LIMIT, 500);
-          const concurrency = toSafeInt(req.query?.concurrency || process.env.RAPPORT_HEBDO_CONCURRENCY, 15);
-          donnees = await calculerReassortGlobal({ limit, concurrency });
-          cacheSet(cacheKey, donnees);
+          const concurrency = toSafeInt(req.query?.concurrency || process.env.RAPPORT_HEBDO_CONCURRENCY, 5);
+          try {
+            donnees = await calculerReassortGlobal({ limit, concurrency, refCache });
+            cacheSet(cacheKey, donnees);
+          } catch (err) {
+            console.error('[RAPPORT-ASYNC] Erreur calculReassortGlobal:', err.message);
+            setJob({ status: 'error', error: `calculReassortGlobal: ${err.message}` });
+            return;
+          }
         }
 
         const ventesParBoutique7j = db.prepare(`
@@ -797,9 +1194,14 @@ const rapport = {
         if (a) prixArticles[code] = a.prix_detail;
       }
       const stockParArticle = {};
+      let stockArticleProgress2 = 0;
       for (const code of codesRapport) {
+        stockArticleProgress2++;
+        if (stockArticleProgress2 % 50 === 0 || stockArticleProgress2 === codesRapport.length) {
+          console.log(`[RAPPORT-ASYNC] stockParArticle ${stockArticleProgress2}/${codesRapport.length}`);
+        }
         try {
-          const stockList = await getStockByCodeArticle(code);
+          const stockList = await getStockByCodeArticle(code, refCache); // réutilise le cache du job
           stockParArticle[code] = {};
           for (const st of stockList) stockParArticle[code][String(st.storeId)] = st.stock;
         } catch(e) { stockParArticle[code] = {}; }
@@ -808,42 +1210,75 @@ const rapport = {
       // Bons de transfert detailles par variante (taille/couleur)
       const bonsTransfert = [];
       const suggestionsTraitees = new Set();
+      // Registre du stock donneur restant (clé = `${donneurId}|${ean}`)
+      // Évite le sur-transfert entre les bons d'un même job.
+      const donorLedger = new Map();
+      let bonsProgress = 0;
       for (const art of donnees.critique) {
         if (ARTICLES_EXCLUS.has(String(art.codeArticle))) continue;
         for (const sug of (art.suggestions || [])) {
           const key = art.codeArticle + '_' + sug.deId + '_' + sug.versId;
           if (suggestionsTraitees.has(key)) continue;
           suggestionsTraitees.add(key);
+          bonsProgress++;
+          if (bonsProgress % 20 === 0) console.log(`[RAPPORT-ASYNC] bonsTransfert suggestions traitées: ${bonsProgress}`);
           try {
             const refs = db.prepare("SELECT DISTINCT reference_article, taille, couleur FROM ventes WHERE code_article = ? AND reference_article IS NOT NULL AND reference_article != ''").all(art.codeArticle);
-            const lignes = [];
+            const candidats = [];
             for (const r of refs) {
-              const result = await cegid.getStockByStore(r.reference_article);
+              // Timeout obligatoire — c'est ici que le job restait bloqué indéfiniment
+              // (await sans timeout sur un appel Cegid qui pouvait ne jamais répondre).
+              let result;
+              try {
+                result = await getStockByStoreCached(r.reference_article, refCache); // réutilise le cache du job au lieu de refetcher
+              } catch (e) {
+                console.warn(`[RAPPORT-ASYNC][BONS-TRANSFERT] Timeout/erreur ${r.reference_article}: ${e.message}`);
+                continue;
+              }
               if (!result.success) continue;
               const stores = result.stores.AvailableQtyByStore || [];
               const stD = stores.find(s => s.StoreId === sug.deId);
               const stR = stores.find(s => s.StoreId === sug.versId);
               const qD = stD ? Math.max(0, parseFloat(stD.AvailableQty) || 0) : 0;
               const qR = stR ? Math.max(0, parseFloat(stR.AvailableQty) || 0) : 0;
-              if (qD >= 1) {
-                const qTransfert = Math.max(1, Math.floor(qD / 2));
-                lignes.push({
+                            if (qD >= 1) {
+                // Lire le stock restant depuis le ledger (décrémenté par les bons précédents)
+                const ledgerKey = `${sug.deId}|${r.reference_article}`;
+                if (!donorLedger.has(ledgerKey)) donorLedger.set(ledgerKey, qD);
+                const restant = donorLedger.get(ledgerKey);
+
+                // Skip si le stock a été épuisé par des bons précédents
+                if (restant < 1) continue;
+
+                candidats.push({
                   ean: r.reference_article,
                   taille: r.taille || '',
                   couleur: r.couleur || '',
                   stockDonneur: qD,
-                  stockReceveur: qR,
-                  quantite: qTransfert
+                  remainingDonneur: restant,
+                  stockReceveur: qR
                 });
               }
             }
+            const allocation = buildDetailedTransferLines(candidats, sug.quantite);
+            const lignes = allocation.lines;
               // Filtrer selon seuil transport
               const seuilBon = (['009','032'].includes(sug.deId) || ['009','032'].includes(sug.versId)) ? 8
                 : (['029'].includes(sug.deId) || ['029'].includes(sug.versId)) ? 5
                 : (['011'].includes(sug.deId) || ['011'].includes(sug.versId)) ? 5 : 1;
               const totalBon = lignes.reduce((s,l) => s + l.quantite, 0);
               if (totalBon < seuilBon) { /* skip - sous seuil */ } else
-            if (lignes.length > 0) {
+                        if (lignes.length > 0) {
+              // Décrémenter le ledger : ce stock est maintenant "réservé"
+              // pour ne pas être proposé à un autre receveur dans le même job.
+              for (const ligne of lignes) {
+                const ledgerKey = `${sug.deId}|${ligne.ean}`;
+                donorLedger.set(
+                  ledgerKey,
+                  Math.max(0, (donorLedger.get(ledgerKey) ?? 0) - ligne.quantite)
+                );
+              }
+
               bonsTransfert.push({
                 codeArticle: art.codeArticle,
                 nomArticle: getNomsArticles(db, [String(art.codeArticle)])[String(art.codeArticle)] || '',
@@ -853,7 +1288,9 @@ const rapport = {
                 receveur: sug.vers,
                 receveurId: sug.versId,
                 lignes,
-                totalUnites: lignes.reduce((s, l) => s + l.quantite, 0)
+                quantiteRecommande: allocation.recommendedQuantity,
+                quantiteNonAllouee: allocation.unallocatedQuantity,
+                totalUnites: allocation.allocatedQuantity
               });
             }
           } catch(e) { /* skip */ }
@@ -950,6 +1387,7 @@ const rapport = {
         try { fs.unlinkSync(tmpPath); } catch (e) {}
 
         setJob({ status: 'ready', filename, outputPath });
+        })(), 20 * 60 * 1000, 'rapport-hebdomadaire job'); // 20 min max, filet de sécurité
       } catch (e) {
         const msg = e?.message || String(e);
         const current = rapportJobs.get(jobId);
@@ -1020,7 +1458,7 @@ function getNomsArticles(db, codes) {
   return noms;
 }
 
-const ARTICLES_EXCLUS = new Set(["91272", "91273", "91274"]);
+const ARTICLES_EXCLUS = new Set(["91272", "91273", "91274", "91275", "91276"]);
 
 // -- CALCUL SCORES MAGASINS -------------------------------------------------
 function calculerScoresMagasins(donnees) {
@@ -1122,23 +1560,41 @@ function calculerRupturesNouvelleCollection(donnees, db, periode) {
 
 
 // Fonction stock temps reel par code article (agregation tous EAN)
-async function getStockByCodeArticle(codeArticle) {
+// refCache (optionnel) : Map<reference, stockResult> partagé pour tout un job.
+// Quand fourni, une référence déjà interrogée ailleurs dans le même job
+// (précalcul calculerReassortGlobal, bonsTransfert...) n'est PAS refetchée.
+// Sans refCache (ex: appel isolé depuis /stock-article), comportement inchangé.
+async function getStockByCodeArticle(codeArticle, refCache = null) {
   const db = require('./config/database');
   const refs = db.prepare(
     "SELECT DISTINCT reference_article FROM ventes WHERE code_article = ? AND reference_article IS NOT NULL"
   ).all(codeArticle);
   const stockTotal = {};
-    await asyncPool(5, refs, async ({ reference_article }) => {
-    const result = await cegid.getStockByStore(reference_article);
-    if (!result.success || !result.stores.AvailableQtyByStore) return;
-    for (const st of result.stores.AvailableQtyByStore) {
+  let referencesLues = 0;
+  await asyncPool(5, refs, async ({ reference_article }) => {
+    // Timeout sur chaque appel Cegid : sans lui, un appel qui ne répond jamais
+    // laisse cette promesse suspendue à vie, ce qui bloquait auparavant tout le job.
+    let result;
+    try {
+      result = await getStockByStoreCached(reference_article, refCache);
+    } catch (e) {
+      console.warn(`[STOCK] Timeout/erreur pour ${reference_article}: ${e.message}`);
+      return;
+    }
+    const stores = result?.stores?.AvailableQtyByStore;
+    if (!result?.success || !Array.isArray(stores)) return;
+
+    referencesLues++;
+    for (const st of stores) {
       const qty = parseFloat(st.AvailableQty) || 0;
       if (!stockTotal[st.StoreId]) {
         stockTotal[st.StoreId] = { storeId: st.StoreId, description: st.StoreDescription, stock: 0 };
       }
       stockTotal[st.StoreId].stock += qty;
     }
-    });
+  });
+
+  assertCompleteStockFetch(refs.length, referencesLues, codeArticle);
   return Object.values(stockTotal);
 }
 
@@ -1147,13 +1603,178 @@ app.get('/stock-article/:codeArticle', async (req, res) => {
   try {
     const code = req.params.codeArticle;
     if (ARTICLES_EXCLUS.has(code)) return res.json({ success: true, codeArticle: code, stockParBoutique: [] });
-    const cacheKey = `stock_${code}`;
+    res.json(await getStockCodeArticleAvecCache(code));
+
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+// ─── CRON JOBS (Import quotidien à 03:00) ────────────────────────────────────
+try {
+  require('./services/cronJobs')(cacheClear, calculerReassortGlobal, cacheSet);
+  console.log('[CRON] Jobs planifiés');
+} catch (e) {
+  console.error('[CRON] Erreur initialisation:', e.message);
+}
+
+// ─── REASSORT PAR CODE ARTICLE (détail complet avec toutes variantes) ───
+app.get('/reassort-article/:codeArticle', async (req, res) => {
+  try {
+    const db = require('./config/database');
+    const codeArticle = req.params.codeArticle;
+    const periode = getPeriodeAnalyse();
+    const cacheKey = `reassort-article:${codeArticle}:${periode.label}`;
+
     const cached = cacheGet(cacheKey);
-    if (cached) return res.json(cached);
-    const stockParBoutique = await getStockByCodeArticle(code);
-    const result = { success: true, codeArticle: code, stockParBoutique };
-    cacheSet(cacheKey, result);
-    res.json(result);
+    if (cached) return res.json({ ...cached, _cache: true });
+
+    // 1. Récupérer toutes les variantes de l'article
+    const variantes = db.prepare(`
+      SELECT DISTINCT reference_article, taille, couleur 
+      FROM ventes 
+      WHERE code_article = ?
+        AND reference_article IS NOT NULL 
+        AND reference_article != ''
+    `).all(codeArticle);
+
+    if (variantes.length === 0) {
+      return res.status(404).json({ success: false, message: 'Article non trouvé' });
+    }
+
+    // 2. Récupérer les infos article
+    const infoArticle = db.prepare(`
+      SELECT code_article, libelle, collection, prix_detail 
+      FROM articles WHERE code_article = ?
+    `).get(codeArticle);
+
+    // 3. Récupérer les ventes par boutique (agrégées)
+    const semaines = periode.jours / 7;
+    const ventesDB = db.prepare(`
+      SELECT store_id, SUM(quantite) as total_vendu 
+      FROM ventes 
+      WHERE code_article = ? 
+        AND date_vente >= date('now', '-${periode.jours} days')
+      GROUP BY store_id
+    `).all(codeArticle);
+
+    const historiqueVentes = ventesDB.map(v => ({
+      storeId: v.store_id,
+      quantite: v.total_vendu / semaines
+    }));
+
+    // 4. Récupérer le stock par variante (Cegid)
+    const stockParEAN = {};
+    const storeTotals = {};
+    
+    for (const v of variantes) {
+      const r = await cegid.getStockByStore(v.reference_article);
+      if (!r.success) continue;
+      
+      stockParEAN[v.reference_article] = {
+        taille: v.taille,
+        couleur: v.couleur,
+        stores: {}
+      };
+      
+      const stores = r.stores.AvailableQtyByStore || [];
+      for (const s of stores) {
+        const qty = parseFloat(s.AvailableQty) || 0;
+        stockParEAN[v.reference_article].stores[s.StoreId] = {
+          name: s.StoreDescription,
+          qty: qty
+        };
+        
+        if (!storeTotals[s.StoreId]) {
+          storeTotals[s.StoreId] = { name: s.StoreDescription, stock: 0 };
+        }
+        storeTotals[s.StoreId].stock += qty;
+      }
+    }
+
+    // 5. Construire la liste des boutiques (format analyserReassort)
+    const stores = Object.keys(storeTotals).map(sid => ({
+      StoreId: sid,
+      StoreDescription: storeTotals[sid].name,
+      AvailableQty: String(storeTotals[sid].stock)
+    }));
+
+    // 6. Analyse réassort
+    const result = reassort.analyserReassort(
+      codeArticle,
+      stores,
+      historiqueVentes,
+      infoArticle?.collection,
+      periode.soldes
+    );
+
+    // 7. Ajouter les variantes détaillées
+    const response = {
+      ...result,
+      codeArticle,
+      libelle: infoArticle?.libelle || codeArticle,
+      saison: infoArticle?.collection,
+      prixDetail: infoArticle?.prix_detail || 0,
+      periode,
+      variantes: Object.entries(stockParEAN).map(([ean, data]) => ({
+        ean,
+        taille: data.taille,
+        couleur: data.couleur,
+        stock: data.stores
+      }))
+    };
+
+    cacheSet(cacheKey, response);
+    res.json(response);
+
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── VARIANTES D'UN ARTICLE (avec stock Cegid) ───
+app.get('/variantes-article/:codeArticle', async (req, res) => {
+  try {
+    const db = require('./config/database');
+    const codeArticle = req.params.codeArticle;
+    const cacheKey = `variantes-article:${codeArticle}`;
+
+    const cached = cacheGet(cacheKey);
+    if (cached) return res.json({ ...cached, _cache: true });
+
+    // Récupérer toutes les variantes
+    const variantes = db.prepare(`
+      SELECT DISTINCT reference_article, taille, couleur 
+      FROM ventes 
+      WHERE code_article = ?
+        AND reference_article IS NOT NULL 
+        AND reference_article != ''
+    `).all(codeArticle);
+
+    // Récupérer le stock Cegid pour chaque EAN
+    const enriched = [];
+    for (const v of variantes) {
+      const r = await cegid.getStockByStore(v.reference_article);
+      if (!r.success) continue;
+
+      const stock = {};
+      (r.stores.AvailableQtyByStore || []).forEach(s => {
+        stock[s.StoreId] = {
+          name: s.StoreDescription,
+          qty: parseFloat(s.AvailableQty) || 0
+        };
+      });
+
+      enriched.push({
+        ean: v.reference_article,
+        taille: v.taille,
+        couleur: v.couleur,
+        stock
+      });
+    }
+
+    const response = { success: true, variantes: enriched };
+    cacheSet(cacheKey, response);
+    res.json(response);
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -1162,9 +1783,7 @@ app.get('/stock-article/:codeArticle', async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   const p = getPeriodeAnalyse();
-  console.log(`Serveur dÃ©marrÃ© sur le port ${PORT}`);
+  console.log(`Serveur démarré sur le port ${PORT}`);
   console.log(`Mode actuel : ${p.label} (${p.jours} jours)`);
   console.log(`Cache TTL : 30 minutes`);
 });
-
-
