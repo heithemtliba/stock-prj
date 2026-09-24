@@ -1,11 +1,13 @@
 /**
  * ══════════════════════════════════════════════════════════════════════════
- * CRON JOBS — Automatisation des tâches récurrentes (CORRIGÉ)
+ * CRON JOBS — Automatisation des tâches récurrentes
  * ══════════════════════════════════════════════════════════════════════════
  *
- * - 03:00  Import quotidien des ventes (SOAP ou CSV)
- * - 04:00  Normalisation des dates dans la base
- * - 06:00  Pré-calcul du cache reassort-global
+ * - 03:00            Import quotidien des ventes (SOAP ou CSV)
+ * - 04:00            Normalisation des dates dans la base
+ * - 05:00 Lundi      Régénération des prévisions ML
+ * - 06:00 Lun-Sam    Pré-calcul du cache reassort-global
+ * - 22:00 Dimanche   Synchronisation du catalogue articles (CSV)
  *
  * Ajouter dans server.js (avant app.listen) :
  *   require('./services/cronJobs')(cacheClear, calculerReassortGlobal, cacheSet);
@@ -13,6 +15,8 @@
  */
 
 const cron = require('node-cron');
+const path = require('path');
+const fs = require('fs');
 
 // ── FONCTION LOCALE (évite le require circulaire avec server.js) ────────
 function getPeriodeAnalyse() {
@@ -73,6 +77,26 @@ module.exports = function initCronJobs(cacheClear, calculerReassortGlobal, cache
     }
   }, { timezone: 'Africa/Tunis' });
 
+  // ── 05:00 Lundi — Régénérer les prévisions ML ──────────────────────
+  cron.schedule('0 5 * * 1', async () => {
+    console.log('[CRON] Régénération des prévisions ML...');
+    try {
+      const { execSync } = require('child_process');
+      const dbPath = path.join(__dirname, '../../data/mabrouk_updated.db');
+      const outputPath = path.join(__dirname, '../../exports/previsions.json');
+      const scriptPath = path.join(__dirname, '../../scripts/prevision_demande.py');
+
+      execSync(`python "${scriptPath}" --db "${dbPath}" --output "${outputPath}" --top 200`, {
+        env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
+        timeout: 30 * 60 * 1000
+      });
+
+      console.log('[CRON] Prévisions ML régénérées');
+    } catch (error) {
+      console.error('[CRON] ERREUR prévisions ML:', error.message);
+    }
+  }, { timezone: 'Africa/Tunis' });
+
   // ── 06:00 — Pré-calcul du reassort global (lundi-samedi) ───────────
   cron.schedule('0 6 * * 1-6', async () => {
     console.log('[CRON] Pré-calcul reassort-global...');
@@ -86,26 +110,28 @@ module.exports = function initCronJobs(cacheClear, calculerReassortGlobal, cache
     }
   }, { timezone: 'Africa/Tunis' });
 
-    // ── 05:00 Lundi — Régénérer les prévisions ML ──────────────────────
-  cron.schedule('0 5 * * 1', async () => {
-    console.log('[CRON] Régénération des prévisions ML...');
+  // ── 22:00 Dimanche — Synchronisation catalogue articles ────────────
+  cron.schedule('0 22 * * 0', async () => {
+    console.log('[CRON] ═══ Synchronisation catalogue articles (API Cegid) ═══');
     try {
-      const { execSync } = require('child_process');
-      const path = require('path');
-      const dbPath = path.join(__dirname, '../../data/mabrouk_updated.db');
-      const outputPath = path.join(__dirname, '../../exports/previsions.json');
-      const scriptPath = path.join(__dirname, '../../scripts/prevision_demande.py');
-      
-      execSync(`python "${scriptPath}" --db "${dbPath}" --output "${outputPath}" --top 200`, {
-        env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
-        timeout: 30 * 60 * 1000
-      });
-      
-      console.log('[CRON] Prévisions ML régénérées');
+      const { syncArticlesFromCegid } = require('./articleSyncService');
+      const result = await syncArticlesFromCegid();
+
+      if (result.imported > 0 || result.updated > 0) {
+        cacheClear();
+        console.log(`[CRON] Cache invalidé après sync articles`);
+      }
+
+      console.log(`[CRON] Articles : ${result.imported} nouveaux, ${result.updated} mis à jour, ${result.errors} erreurs`);
     } catch (error) {
-      console.error('[CRON] ERREUR prévisions ML:', error.message);
+      console.error('[CRON] ERREUR sync articles:', error.message);
     }
   }, { timezone: 'Africa/Tunis' });
 
-   console.log('[CRON] Jobs planifiés : import 03:00, normalisation 04:00, prévisions 05:00 (lundi), reassort 06:00');
+  console.log('[CRON] Jobs planifiés :');
+  console.log('[CRON]   - 03:00 quotidien   : import ventes');
+  console.log('[CRON]   - 04:00 quotidien   : normalisation dates');
+  console.log('[CRON]   - 05:00 lundi       : prévisions ML');
+  console.log('[CRON]   - 06:00 lun-sam     : reassort global');
+  console.log('[CRON]   - 22:00 dimanche    : sync catalogue articles (API Cegid)');
 };

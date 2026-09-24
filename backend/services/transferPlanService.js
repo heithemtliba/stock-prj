@@ -30,14 +30,21 @@ function buildDetailedTransferLines(candidates, recommendedQuantity) {
     };
   }
 
-  const safeCandidates = (Array.isArray(candidates) ? candidates : [])
-    .map((candidate) => ({
-      ean: String(candidate?.ean ?? ''),
-      taille: candidate?.taille ?? '',
-      couleur: candidate?.couleur ?? '',
-      stockDonneur: toNonNegativeNumber(candidate?.stockDonneur),
-      stockReceveur: toNonNegativeNumber(candidate?.stockReceveur)
-    }))
+    const safeCandidates = (Array.isArray(candidates) ? candidates : [])
+    .map((candidate) => {
+      const stockDonneur = toNonNegativeNumber(candidate?.stockDonneur);
+      return {
+        ean: String(candidate?.ean ?? ''),
+        taille: candidate?.taille ?? '',
+        couleur: candidate?.couleur ?? '',
+        stockDonneur,
+        // NOUVEAU : stock encore réservable (défaut = stock d'origine)
+        remainingDonneur: candidate?.remainingDonneur === undefined
+          ? stockDonneur
+          : toNonNegativeNumber(candidate.remainingDonneur),
+        stockReceveur: toNonNegativeNumber(candidate?.stockReceveur)
+      };
+    })
     .filter((candidate) => candidate.ean && candidate.stockDonneur >= 1)
     .sort((a, b) => {
       if (a.stockReceveur !== b.stockReceveur) return a.stockReceveur - b.stockReceveur;
@@ -53,15 +60,25 @@ function buildDetailedTransferLines(candidates, recommendedQuantity) {
 
     // Conserve la règle historique du bon détaillé : céder au plus ~50 %
     // du stock de la variante (et 1 unité si le stock variante vaut 1).
+        // Conserve la règle historique du bon détaillé : céder au plus ~50 %
+    // du stock d'ORIGINE de la variante (et 1 unité si stock = 1).
+    // MAIS limité par ce qu'il reste réellement à céder (remainingDonneur).
     const maxForVariant = Math.min(
-      candidate.stockDonneur,
+      candidate.remainingDonneur,
       Math.max(1, Math.floor(candidate.stockDonneur / 2))
     );
 
     const quantity = Math.min(remaining, maxForVariant);
     if (quantity <= 0) continue;
 
-    lines.push({ ...candidate, quantite: quantity });
+     lines.push({
+      ean: candidate.ean,
+      taille: candidate.taille,
+      couleur: candidate.couleur,
+      stockDonneur: candidate.stockDonneur,
+      stockReceveur: candidate.stockReceveur,
+      quantite: quantity
+    });
     remaining -= quantity;
   }
 
