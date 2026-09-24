@@ -259,7 +259,7 @@ async function calculerReassortGlobal(opts = {}) {
       const stores = buildArticleStores(stockState.rows, historiqueVentes, config.stores);
       const prixArticle = db.prepare('SELECT prix_detail FROM articles WHERE code_article = ?').get(article.code_article);
       const prevML = previsions[article.code_article] || {};
-      const analyse = reassort.analyserReassort(
+            const analyse = reassort.analyserReassort(
         ref, 
         stores, 
         historiqueVentes, 
@@ -267,6 +267,7 @@ async function calculerReassortGlobal(opts = {}) {
         periode.soldes, 
         joursExposition,
         {
+           codeArticle: article.code_article, // ← NOUVEAU : pour le log
            prixUnitaire: prixArticle?.prix_detail || 0,
            tendance: prevML.tendance || 1.0,
            ventesHistorique: historiqueVentes.map(h => h.quantite)
@@ -355,7 +356,40 @@ app.post('/cache-clear', (req, res) => {
 
 // STOCK
 app.get('/stock', async (req, res) => res.json(await cegid.getStockAllStores()));
-app.get('/stock/:reference', async (req, res) => res.json(await cegid.getStockByStore(req.params.reference)));
+// ─── DÉTECTION EAN vs CODE_ARTICLE ───
+const { estCodeArticle: _estCodeArticle } = require('./services/refDetection');
+const estCodeArticle = (ref) => _estCodeArticle(ref, require('./config/database'));
+
+// ─── STOCK AGRÉGÉ D'UN CODE_ARTICLE (avec cache partagé) ───
+async function getStockCodeArticleAvecCache(code) {
+  const cacheKey = `stock_${code}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return cached;
+  const stockParBoutique = await getStockByCodeArticle(code);
+  const result = { success: true, codeArticle: code, stockParBoutique };
+  cacheSet(cacheKey, result);
+  return result;
+}
+
+// STOCK — accepte EAN ou code_article
+app.get('/stock/:reference', async (req, res) => {
+  try {
+    const ref = String(req.params.reference).trim();
+
+    if (estCodeArticle(ref)) {
+      if (ARTICLES_EXCLUS.has(ref)) {
+        return res.json({ success: true, codeArticle: ref, stockParBoutique: [], type: 'code_article' });
+      }
+      const result = await getStockCodeArticleAvecCache(ref);
+      return res.json({ ...result, type: 'code_article' });
+    }
+
+    // EAN : comportement d'origine
+    return res.json(await cegid.getStockByStore(ref));
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
 
 // VENTES
 app.get('/ventes-stats', (req, res) => {
@@ -1569,13 +1603,8 @@ app.get('/stock-article/:codeArticle', async (req, res) => {
   try {
     const code = req.params.codeArticle;
     if (ARTICLES_EXCLUS.has(code)) return res.json({ success: true, codeArticle: code, stockParBoutique: [] });
-    const cacheKey = `stock_${code}`;
-    const cached = cacheGet(cacheKey);
-    if (cached) return res.json(cached);
-    const stockParBoutique = await getStockByCodeArticle(code);
-    const result = { success: true, codeArticle: code, stockParBoutique };
-    cacheSet(cacheKey, result);
-    res.json(result);
+    res.json(await getStockCodeArticleAvecCache(code));
+
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }

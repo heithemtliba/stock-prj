@@ -265,11 +265,12 @@ function analyserReassort(reference, stores, historiqueVentes, saison = null, so
       };
     });
 
-  // Receveurs : boutiques critiques ou faibles
-  const receveurs = analyse
+   // Receveurs : boutiques critiques ou faibles
+   const receveurs = analyse
     .filter(s => (s.statut === 'CRITIQUE' || s.statut === 'FAIBLE') && s.ventesParSemaine >= 0.25)
     .sort((a, b) => {
       if (a.statut !== b.statut) return a.statut === 'CRITIQUE' ? -1 : 1;
+      if (a.joursStock !== b.joursStock) return a.joursStock - b.joursStock; // ← NOUVEAU : urgence réelle
       return b.ventesParSemaine - a.ventesParSemaine;
     });
 
@@ -293,6 +294,7 @@ function analyserReassort(reference, stores, historiqueVentes, saison = null, so
 
   // ── GÉNÉRATION DES SUGGESTIONS (améliorée) ──────────────────────────
   const suggestions = [];
+  const nonServis = []; // ← NOUVEAU : pour logger les receveurs non servis
 
   receveurs.forEach(receveur => {
     const objectifSemaines = receveur.statut === 'CRITIQUE' ? 3 : 2;
@@ -301,16 +303,19 @@ function analyserReassort(reference, stores, historiqueVentes, saison = null, so
 
     let qteRestante = qteNecessaire;
 
+        // Détecter si ce receveur a été servi
+    const avant = suggestions.length;
+
     // NOUVEAU V2 : Trier les donneurs par score donneur (intègre le coût transport)
     const donneursTriesPourReceveur = donneurs
       .filter(d => d.storeId !== receveur.storeId)
       .map(d => ({
-        ...d,
+        ref: d, // ← NOUVEAU : référence à l'objet ORIGINAL (pas une copie)
         scoreDonneurCalc: calculerScoreDonneur(d, d.ventesParSemaine, saison, receveur.storeId)
       }))
       .sort((a, b) => b.scoreDonneurCalc - a.scoreDonneurCalc);
 
-    donneursTriesPourReceveur.forEach(donneur => {
+    donneursTriesPourReceveur.forEach(({ ref: donneur, scoreDonneurCalc }) => {
       if (qteRestante <= 0) return;
 
       const stockMinimum = DEPOTS_DONNEURS.includes(donneur.storeId)
@@ -340,7 +345,7 @@ function analyserReassort(reference, stores, historiqueVentes, saison = null, so
         ? 'Article saison actuelle - redistribuer ET commander si insuffisant'
         : 'Article ancienne saison - redistribuer uniquement, ne pas commander';
 
-      const scoreDonneur = donneur.scoreDonneurCalc;
+            const scoreDonneur = scoreDonneurCalc; // ← NOUVEAU : variable capturée
       const scoreReceveur = calculerScoreStore(receveur, receveur.ventesParSemaine, saison);
 
       suggestions.push({
@@ -364,7 +369,13 @@ function analyserReassort(reference, stores, historiqueVentes, saison = null, so
       donneur.stock -= qteATransferer;
       qteRestante -= qteATransferer;
     });
+
+    if (suggestions.length === avant) nonServis.push(receveur.storeName);
   });
+
+  if (nonServis.length > 0 && suggestions.length > 0) {
+    console.log(`[REASSORT] Article ${options.codeArticle || reference} : ${nonServis.length} receveurs non servis (stock épuisé)`);
+  }
 
   const stockTotal = analyse.reduce((sum, s) => sum + s.stock, 0) +
     depotCentral.reduce((sum, s) => sum + s.stock, 0);
